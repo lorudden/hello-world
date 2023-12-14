@@ -15,10 +15,12 @@ Testrepo för att labba lite med olika wireup för projektet
 Öppna en terminal
 
 ```bash
-go install github.com/a-h/templ/cmd/templ@latest
-
 git clone git@github.com:lorudden/hello-world.git
 cd hello-world
+
+go install github.com/a-h/templ/cmd/templ@latest
+templ generate
+go run cmd/hello-world/main.go
 ```
 
 ## Titta på resultatet
