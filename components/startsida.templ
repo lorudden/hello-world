@@ -1,12 +1,19 @@
 package components
 
-templ StartSida(titel, namn string) {
+import "fmt"
+
+func cacheBuster(path, version, filename string) string {
+    return fmt.Sprintf("/%s/%s/%s", path, version, filename)
+}
+
+templ StartSida(cssVersion, htmxVersion, titel, namn string) {
     <html>
         <head>
             <meta charset="UTF-8"/>
             <meta http-equiv="refresh" content="3"/>
             <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-            <script src="https://cdn.tailwindcss.com"></script>
+            <script src={ cacheBuster("js", htmxVersion, "htmx.min.js") }></script>
+            <link href={ cacheBuster("css", cssVersion, "tailwind.css") } rel="stylesheet" />
             <title>{titel}</title>
         </head>
         @Body(namn)
