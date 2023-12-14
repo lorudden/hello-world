@@ -10,6 +10,11 @@ Testrepo för att labba lite med olika wireup för projektet
 * Go
 * Visual Studio Code
 
+```
+go install github.com/a-h/templ/cmd/templ@latest
+go install github.com/cosmtrek/air@latest
+```
+
 ## Starta upp
 
 Öppna en terminal
@@ -17,10 +22,8 @@ Testrepo för att labba lite med olika wireup för projektet
 ```bash
 git clone git@github.com:lorudden/hello-world.git
 cd hello-world
-
-go install github.com/a-h/templ/cmd/templ@latest
-templ generate
-go run cmd/hello-world/main.go
+code .
+air
 ```
 
 ## Titta på resultatet
