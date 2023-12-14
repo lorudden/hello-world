@@ -6,6 +6,7 @@ Testrepo för att labba lite med olika wireup för projektet
 
 * SSH-nyckel
 * Docker
+* Git
 * Go
 * Visual Studio Code
 
@@ -14,7 +15,12 @@ Testrepo för att labba lite med olika wireup för projektet
 Öppna en terminal
 
 ```bash
+go install github.com/a-h/templ/cmd/templ@latest
+
 git clone git@github.com:lorudden/hello-world.git
 cd hello-world
-go run cmd/hello-world/main.go
 ```
+
+## Titta på resultatet
+
+Surfa till http://localhost:3000
