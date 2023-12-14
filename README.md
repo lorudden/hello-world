@@ -9,6 +9,7 @@ Testrepo för att labba lite med olika wireup för projektet
 * Git
 * Go
 * Visual Studio Code
+* tailwindcss
 
 ```
 go install github.com/a-h/templ/cmd/templ@latest
