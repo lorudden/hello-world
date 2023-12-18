@@ -1,0 +1,35 @@
+package components
+
+import "fmt"
+
+templ MenuContents(menu string) {
+    <div>Hello from Backend!</div>
+}
+
+templ DropDownMenu(title, category, slug, target string) {
+    <div class="group relative inline-block hover:block">
+      @Menu(title, category, slug, target)
+      <div class="absolute hidden group-hover:block bg-blue-200 min-w-40 p-4 z-1"
+            hx-get={ fmt.Sprintf("/menu/%s/%s", category, slug) }
+            hx-trigger="load">
+      </div>
+    </div>
+}
+
+templ Menu(title, category, slug, target string) {
+    <div class="align-middle h-9 px-3 hover:bg-zinc-700"
+            hx-get={ fmt.Sprintf("/%s/%s", category, slug) }
+            hx-target={target}
+            hx-trigger="click">
+        {title}
+    </div>
+}
+
+templ NavBar() {
+    <div class="flex">
+    @Menu("Hem", "pages", "home", "#content-div")
+    @DropDownMenu("Nyheter", "news", "", "#content-div")
+    @DropDownMenu("Hamnföreningen", "pages", "hamnforeningen", "#content-div")
+    @Menu("Lörudden", "pages", "lorudden", "#content-div")
+    </div>
+}

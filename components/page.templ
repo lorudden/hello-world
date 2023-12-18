@@ -1,0 +1,13 @@
+package components
+
+templ Page(contents []string) {
+    <div class="grid-cols-8">
+        <p class="text-lg my-8">{ contents[0] }</p>
+
+        for _, p := range contents[1:] {
+            <p class="text-sm p-4">
+                { p }
+            </p>
+        }
+    </div>
+}

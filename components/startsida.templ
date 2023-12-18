@@ -8,16 +8,17 @@ func cacheBuster(path, hash, filename string) string {
     return fmt.Sprintf("/%s/%s/%s", path, hash, filename)
 }
 
-templ StartSida(cssHash, htmxHash, titel, namn string) {
+templ StartSida(cssHash, htmxHash, title, name string) {
+    <!doctype html>
     <html>
         <head>
             <meta charset="UTF-8"/>
-            <meta http-equiv="refresh" content="3"/>
+            //<meta http-equiv="refresh" content="2"/>
             <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
             <script src={ cacheBuster("js", htmxHash, "htmx.min.js") }></script>
             <link href={ cacheBuster("css", cssHash, "tailwind.css") } rel="stylesheet" />
-            <title>{titel}</title>
+            <title>{title}</title>
         </head>
-        @Body(namn)
+        @Body(name)
     </html>
 }

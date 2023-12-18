@@ -1,0 +1,33 @@
+package components
+
+import (
+    "fmt"
+    "time"
+)
+
+type NewsItem struct {
+	Title  string
+	Body   []string
+	Posted time.Time
+	Author string
+}
+
+
+templ News(news []NewsItem) {
+
+    for _, n := range news {
+        <div class="grid-columns-8">
+            <p class="text-xl">
+                { n.Title }
+            </p>
+
+            for _, p := range n.Body {
+                <p class="text-sm">
+                    { p }
+                </p>
+            }
+
+            { fmt.Sprintf("Postat av %s %s", n.Author, n.Posted.Format(time.DateTime)) }
+        </div>
+    }
+}

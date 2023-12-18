@@ -1,0 +1,28 @@
+package components
+
+templ AppStartSida(cssHash, htmxHash, titel, namn string) {
+    <doc xmlns="https://hyperview.org/hyperview">
+    <screen>
+        <body style="body" safe-area="true">
+            <header style="header">
+                <text style="header-title">Contact.app</text>
+            </header>
+
+            <view style="main">
+                <form>
+                    <text-field name="q" value="" placeholder="Search..." style="search-field" />
+                    <list id="contacts-list">
+                        <items xmlns="https://hyperview.org/hyperview">
+                            <item key="42" style="contact-item">
+                            <text style="contact-item-label">
+                                070-2096336
+                            </text>
+                            </item>
+                        </items>
+                    </list>
+                </form>
+            </view>
+        </body>
+    </screen>
+    </doc>
+}
