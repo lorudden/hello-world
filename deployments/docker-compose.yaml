@@ -1,0 +1,98 @@
+version: '3'
+services:
+
+  proxy:
+    image: 'registry.access.redhat.com/ubi9/nginx-122'
+    command:
+      - nginx
+      - -g
+      - daemon off;
+    restart: always
+    depends_on:
+      hello-world:
+        condition: service_healthy
+    volumes:
+      - ./configs/proxy/nginx.conf:/etc/nginx/nginx.conf
+      - ./configs/proxy/openssl/server.crt:/etc/ssl/server.crt
+      - ./configs/proxy/openssl/server.key:/etc/ssl/server.key
+      - ./configs/keycloak/openssl/server.crt:/etc/ssl/kc-server.crt
+      - ./configs/keycloak/openssl/server.key:/etc/ssl/kc-server.key
+    ports:
+      - '8443:443'
+      - '8444:444'
+
+
+  hello-world:
+    image: 'lorudden/hello-world:latest'
+    build:
+      context: ..
+      dockerfile: ./deployments/Dockerfile
+    restart: always
+    environment:
+      SERVICE_PORT: '3000'
+    ports:
+      - '3000'
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-f",
+          "http://localhost:3000/health/ready"
+        ]
+      interval: 5s
+      timeout: 2s
+      retries: 36
+      start_period: 5s
+  
+  keycloak:
+    image: quay.io/keycloak/keycloak:23.0
+    command:
+      - 'start-dev'
+      - '--hostname=iam.xn--lrudden-90a.local'
+      - '--hostname-port=8444'
+      - '--proxy=edge'
+      - '--health-enabled=true'
+      - '-Dkeycloak.migration.action=import'
+      - '-Dkeycloak.migration.provider=singleFile'
+      - '-Dkeycloak.migration.strategy=OVERWRITE_EXISTING'
+      - '-Dkeycloak.migration.file=/application-realm.json'
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    ports:
+      - '8080'
+    volumes:
+      - ./configs/keycloak/realm.json:/application-realm.json
+
+
+  #postgres:
+  #  image: ghcr.io/diwise/test-db-postgresql:prod-824e7cffd65dd3766c88441a48cffd5b2acd55f2
+  #  restart: always
+  #  healthcheck:
+  #    test: [ "CMD-SHELL", "pg_isready -d lorudden -U testuser" ]
+  #    interval: 5s
+  #    timeout: 5s
+  #    retries: 12
+  #    start_period: 10s
+  #  environment:
+  #    POSTGRES_USER: 'testuser'
+  #    POSTGRES_PASSWORD: 'testpass'
+  #    POSTGRES_DB: 'lorudden'
+  #    POSTGRES_HOST_AUTH_METHOD: 'trust'
+  #  ports:
+  #    - '5432:5432'
+
+  #pgadmin:
+  #  image: dpage/pgadmin4:7.3
+  #  restart: always
+  #  ports:
+  #    - "5050:80"
+  #  environment:
+  #    PGADMIN_DEFAULT_EMAIL: admin@lorudden.io
+  #    PGADMIN_DEFAULT_PASSWORD: password
+  #  volumes:
+  #    - pgadmin-data:/var/lib/pgadmin
+
+volumes:
+  pgadmin-data: ~
