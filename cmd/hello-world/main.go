@@ -43,6 +43,18 @@ func main() {
 		}
 	}())
 
+	r.Get("/health/ready", func() http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			resp, err := http.Get("http://keycloak:8080/health/ready")
+			if err != nil || resp.StatusCode != http.StatusOK {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+
+			w.WriteHeader(http.StatusOK)
+		}
+	}())
+
 	r.Get("/api/swishqr/{size}/{phone}/{sum}/{msg}", NewSwishQRHandler())
 
 	r.Get("/css/{hash}/tailwind.css", func() http.HandlerFunc {
