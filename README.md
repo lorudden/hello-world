@@ -47,12 +47,12 @@ Om du däremot har en Windows-dator så behöver du lägga till samma rader i C:
 ### Starta och stoppa compose
 
 ```bash
-docker compose -f deployments/docker-compose.yaml build
-docker compose -f deployments/docker-compose.yaml up
-# Surfa till https://lörudden.local:8444 för att se resultatet
-# Webläsaren kommer att klaga på att certifikatet är ogiltigt, men klicka
-# dig fram till sidan ändå så kommer den att dyka upp
+docker compose -f deployments/docker-compose.yaml up --build
 
-# När du är färdig så stänger du ner allt med följande kommando
+# Surfa till https://lörudden.local:8443 för att se resultatet
+# Webläsaren kommer att klaga på att certifikatet är ogiltigt, men klicka
+# dig fram till sidan ändå, så kommer den att dyka upp
+
+# När du är färdig så stänger du ner allt med det här kommandot
 docker compose -f deployments/docker-compose.yaml down -v --remove-orphans
 ```
