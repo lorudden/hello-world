@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,15 +23,25 @@ import (
 
 func main() {
 
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
 	r := chi.NewRouter()
 
 	css, sha256CSS := loadStaticAssetOrDie("./css/output.css")
 	htmx, sha256HTMX := loadStaticAssetOrDie("./js/htmx.min.js")
 
+	tokenExchange := NewPhantomTokenExchange(logger)
+
 	r.Use(middleware.Logger)
+	r.Use(tokenExchange.Middleware())
 
 	r.Get("/", func() http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
+
+			authHeader := r.Header.Get("Authorization")
+			if authHeader != "" {
+				logger.Info("got auth header", "jwt", authHeader)
+			}
 
 			fmt.Printf("request from %s with accept %v\n", r.UserAgent(), r.Header["Accept"])
 
@@ -42,6 +53,9 @@ func main() {
 			component.Render(r.Context(), w)
 		}
 	}())
+
+	r.Get("/login", tokenExchange.LoginHandler())
+	r.Get("/logout", tokenExchange.LogoutHandler())
 
 	r.Get("/health/ready", func() http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {

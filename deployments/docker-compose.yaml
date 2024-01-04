@@ -32,6 +32,8 @@ services:
       SERVICE_PORT: '3000'
     ports:
       - '3000'
+    extra_hosts:
+      - "iam.xn--lrudden-90a.local:172.17.0.1"
     healthcheck:
       test:
         [

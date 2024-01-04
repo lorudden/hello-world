@@ -300,6 +300,7 @@
       ],
       "security-admin-console": [],
       "admin-cli": [],
+      "hello-world": [],
       "account-console": [],
       "broker": [
         {
@@ -469,6 +470,62 @@
   "webAuthnPolicyPasswordlessAvoidSameAuthenticatorRegister": false,
   "webAuthnPolicyPasswordlessAcceptableAaguids": [],
   "webAuthnPolicyPasswordlessExtraOrigins": [],
+  "users": [
+    {
+      "username": "anna",
+      "email": "anna@lorudden.local",
+      "lastName": "Hamnf",
+      "firstName": "Anna",
+      "enabled": true,
+      "emailVerified": true,
+      "requiredActions": [],
+      "attributes": {},
+      "credentials": [
+        {
+          "type": "password",
+          "value": "s3cr3t"
+        }
+      ],
+      "clientRoles": {},
+      "groups": ["/hamnforeningen"]
+    },
+    {
+      "username": "barbro",
+      "email": "barbro@lorudden.local",
+      "lastName": "Arrendator",
+      "firstName": "Barbro",
+      "enabled": true,
+      "emailVerified": true,
+      "requiredActions": [],
+      "attributes": {},
+      "credentials": [
+        {
+          "type": "password",
+          "value": "s3cr3t"
+        }
+      ],
+      "clientRoles": {},
+      "groups": ["/arrendeforeningen"]
+    },
+    {
+      "username": "cissi",
+      "email": "cecilia@lorudden.local",
+      "lastName": "Båtägare",
+      "firstName": "Cecilia",
+      "enabled": true,
+      "emailVerified": true,
+      "requiredActions": [],
+      "attributes": {},
+      "credentials": [
+        {
+          "type": "password",
+          "value": "s3cr3t"
+        }
+      ],
+      "clientRoles": {},
+      "groups": ["/batplatsinnehavare"]
+    }
+  ],
   "scopeMappings": [
     {
       "clientScope": "offline_access",
@@ -654,6 +711,60 @@
       "authenticationFlowBindingOverrides": {},
       "fullScopeAllowed": false,
       "nodeReRegistrationTimeout": 0,
+      "defaultClientScopes": [
+        "web-origins",
+        "acr",
+        "profile",
+        "roles",
+        "email"
+      ],
+      "optionalClientScopes": [
+        "address",
+        "phone",
+        "offline_access",
+        "microprofile-jwt"
+      ]
+    },
+    {
+      "id": "dc5258ab-72ff-43e3-aac4-0f8e25986084",
+      "clientId": "hello-world",
+      "name": "Testklient",
+      "description": "",
+      "rootUrl": "",
+      "adminUrl": "",
+      "baseUrl": "https://xn--lrudden-90a.local:8443/",
+      "surrogateAuthRequired": false,
+      "enabled": true,
+      "alwaysDisplayInConsole": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "oPMxXzsk6lLntEJqsOpqGZZf4PXHGvRT",
+      "redirectUris": [
+        "https://xn--lrudden-90a.local:8443/*"
+      ],
+      "webOrigins": [
+        "*"
+      ],
+      "notBefore": 0,
+      "bearerOnly": false,
+      "consentRequired": false,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "publicClient": false,
+      "frontchannelLogout": true,
+      "protocol": "openid-connect",
+      "attributes": {
+        "oidc.ciba.grant.enabled": "false",
+        "client.secret.creation.time": "1704369583",
+        "backchannel.logout.session.required": "true",
+        "post.logout.redirect.uris": "+",
+        "oauth2.device.authorization.grant.enabled": "false",
+        "backchannel.logout.revoke.offline.tokens": "false"
+      },
+      "authenticationFlowBindingOverrides": {},
+      "fullScopeAllowed": true,
+      "nodeReRegistrationTimeout": -1,
       "defaultClientScopes": [
         "web-origins",
         "acr",
@@ -1426,13 +1537,13 @@
         "config": {
           "allowed-protocol-mapper-types": [
             "oidc-address-mapper",
-            "saml-role-list-mapper",
-            "oidc-full-name-mapper",
-            "oidc-sha256-pairwise-sub-mapper",
-            "saml-user-property-mapper",
-            "saml-user-attribute-mapper",
             "oidc-usermodel-property-mapper",
-            "oidc-usermodel-attribute-mapper"
+            "oidc-full-name-mapper",
+            "saml-user-property-mapper",
+            "oidc-sha256-pairwise-sub-mapper",
+            "oidc-usermodel-attribute-mapper",
+            "saml-role-list-mapper",
+            "saml-user-attribute-mapper"
           ]
         }
       },
@@ -1446,12 +1557,12 @@
           "allowed-protocol-mapper-types": [
             "oidc-sha256-pairwise-sub-mapper",
             "oidc-full-name-mapper",
-            "saml-user-property-mapper",
-            "oidc-usermodel-property-mapper",
-            "oidc-address-mapper",
             "oidc-usermodel-attribute-mapper",
+            "saml-role-list-mapper",
+            "oidc-address-mapper",
+            "oidc-usermodel-property-mapper",
             "saml-user-attribute-mapper",
-            "saml-role-list-mapper"
+            "saml-user-property-mapper"
           ]
         }
       }
