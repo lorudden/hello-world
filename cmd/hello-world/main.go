@@ -18,6 +18,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/lorudden/hello-world/components"
+	authz "github.com/lorudden/hello-world/internal/pkg/authorization"
+	"github.com/lorudden/hello-world/internal/pkg/tokens"
 	qrcode "github.com/skip2/go-qrcode"
 )
 
@@ -30,23 +32,20 @@ func main() {
 	css, sha256CSS := loadStaticAssetOrDie("./css/output.css")
 	htmx, sha256HTMX := loadStaticAssetOrDie("./js/htmx.min.js")
 
-	tokenExchange := NewPhantomTokenExchange(logger)
+	tokenExchange := tokens.NewPhantomTokenExchange(logger)
 
 	r.Use(middleware.Logger)
 	r.Use(tokenExchange.Middleware())
+	r.Use(authz.Middleware())
 
 	r.Get("/", func() http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
-
-			authHeader := r.Header.Get("Authorization")
-			if authHeader != "" {
-				logger.Info("got auth header", "jwt", authHeader)
-			}
 
 			fmt.Printf("request from %s with accept %v\n", r.UserAgent(), r.Header["Accept"])
 
 			w.Header().Add("Content-Type", "text/html")
 			w.Header().Add("Cache-Control", "no-cache")
+			w.Header().Add("Strict-Transport-Security", "max-age=86400; includeSubDomains")
 			w.WriteHeader(http.StatusOK)
 
 			component := components.StartSida(sha256CSS, sha256HTMX, "Nu kör vi!", "Lörudden")

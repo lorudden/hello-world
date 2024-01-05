@@ -1,4 +1,4 @@
-package main
+package tokens
 
 import (
 	"context"
@@ -45,7 +45,7 @@ type phantomTokens struct {
 func NewPhantomTokenExchange(logger *slog.Logger) PhantomTokenExchange {
 	return &phantomTokens{
 		logger:     logger,
-		cookieName: "hello-id",
+		cookieName: "__Host-id",
 		tokens:     map[string]storedTokens{},
 	}
 }
@@ -292,6 +292,7 @@ func (pt *phantomTokens) LoginHandler() http.HandlerFunc {
 			return
 		}
 
+		// TODO: Skapa riktigt random id i stället för uuid
 		tokenID := uuid.NewString()
 		pt.tokens[tokenID] = storedTokens{
 			authToken: oauth2Token,
@@ -305,7 +306,7 @@ func (pt *phantomTokens) LoginHandler() http.HandlerFunc {
 
 		http.SetCookie(w, cookie)
 
-		pt.logger.Info("retrieved token via iodc", "contents", string(data))
+		pt.logger.Info("retrieved token via oidc", "contents", string(data))
 
 		http.Redirect(w, r, "/", http.StatusFound)
 	}

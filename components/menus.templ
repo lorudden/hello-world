@@ -1,6 +1,9 @@
 package components
 
-import "fmt"
+import (
+    "fmt"
+    authz "github.com/lorudden/hello-world/internal/pkg/authorization"
+)
 
 templ MenuContents(menu string) {
     <div>Hello from Backend!</div>
@@ -14,6 +17,22 @@ templ DropDownMenu(title, category, slug, target string) {
             hx-trigger="load">
       </div>
     </div>
+}
+
+templ Button(title, href string) {
+    <a href={ templ.URL(href) }>
+        <div class="">
+            {title}
+        </div>
+    </a>
+}
+
+templ LoginOrOutButton() {
+    if authz.IsLoggedIn(ctx) {
+        @Button("Logga Ut", "/logout")
+    } else {
+        @Button("Logga In", "/login")
+    }
 }
 
 templ Menu(title, category, slug, target string) {
@@ -31,5 +50,6 @@ templ NavBar() {
     @DropDownMenu("Nyheter", "news", "", "#content-div")
     @DropDownMenu("Hamnföreningen", "pages", "hamnforeningen", "#content-div")
     @Menu("Lörudden", "pages", "lorudden", "#content-div")
+    @LoginOrOutButton()
     </div>
 }
