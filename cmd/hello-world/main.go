@@ -39,6 +39,10 @@ func main() {
 			"hello-world",
 			"oPMxXzsk6lLntEJqsOpqGZZf4PXHGvRT",
 		),
+		tokens.WithRedirects(
+			"https://xn--lrudden-90a.local:8443/login",
+			"https://xn--lrudden-90a.local:8443/",
+		),
 		tokens.WithInsecureSkipVerify(),
 	)
 

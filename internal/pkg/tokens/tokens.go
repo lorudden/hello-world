@@ -48,6 +48,9 @@ type phantomTokens struct {
 	clientID     string
 	clientSecret string
 
+	loginRedirectURL  string
+	logoutRedirectURL string
+
 	cookieName string
 
 	secretKey []byte
@@ -83,6 +86,13 @@ func WithProvider(configURL, clientID, clientSecret string) func(*phantomTokens)
 	}
 }
 
+func WithRedirects(login, logout string) func(*phantomTokens) {
+	return func(pt *phantomTokens) {
+		pt.loginRedirectURL = login
+		pt.logoutRedirectURL = logout
+	}
+}
+
 func WithSecretKey(key []byte) func(*phantomTokens) {
 	return func(pt *phantomTokens) {
 		if len(key) != 32 {
@@ -94,7 +104,13 @@ func WithSecretKey(key []byte) func(*phantomTokens) {
 
 func NewPhantomTokenExchange(opts ...func(*phantomTokens)) (PhantomTokenExchange, error) {
 
+	defaults := []func(*phantomTokens){
+		WithCookieName("id"),
+	}
+
 	pt := &phantomTokens{}
+
+	opts = append(defaults, opts...)
 
 	for _, opt := range opts {
 		opt(pt)
@@ -110,10 +126,6 @@ func NewPhantomTokenExchange(opts ...func(*phantomTokens)) (PhantomTokenExchange
 		WithSecretKey(secretKey)(pt)
 	}
 
-	if pt.cookieName == "" {
-		WithCookieName("id")(pt)
-	}
-
 	go func(ctx context.Context) {
 		provider, err := oidc.NewProvider(ctx, pt.configURL)
 		for err != nil {
@@ -126,7 +138,7 @@ func NewPhantomTokenExchange(opts ...func(*phantomTokens)) (PhantomTokenExchange
 		pt.oauth2Config = oauth2.Config{
 			ClientID:     pt.clientID,
 			ClientSecret: pt.clientSecret,
-			RedirectURL:  "https://xn--lrudden-90a.local:8443/login",
+			RedirectURL:  pt.loginRedirectURL,
 			Endpoint:     provider.Endpoint(),
 			Scopes:       []string{oidc.ScopeOpenID, "profile", "email"},
 		}
@@ -454,13 +466,9 @@ func (pt *phantomTokens) LogoutHandler() http.HandlerFunc {
 
 		pt.clearCookie(w)
 
-		//storedTokens, ok := pt.tokens[cookie.SessionID]
-
 		if cookie.Token.Valid() {
-			//delete(pt.tokens, cookie.SessionID)
-
 			logoutURL := pt.configURL + "/protocol/openid-connect/logout?id_token_hint=" + cookie.IdToken + "&post_logout_redirect_uri="
-			logoutURL += url.QueryEscape("https://xn--lrudden-90a.local:8443/")
+			logoutURL += url.QueryEscape(pt.logoutRedirectURL)
 
 			http.Redirect(w, r, logoutURL, http.StatusFound)
 			return
