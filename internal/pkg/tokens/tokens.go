@@ -1,20 +1,21 @@
 package tokens
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -29,116 +30,161 @@ type PhantomTokenExchange interface {
 	LogoutHandler() http.HandlerFunc
 }
 
-type storedTokens struct {
-	idToken   string
-	authToken *oauth2.Token
+type cookieValue struct {
+	LoginState     string `json:"state"`
+	LoginValidator string `json:"validator"`
+
+	SessionID string `json:"session"`
+	SourceIP  string `json:"ip"`
+
+	Token   *oauth2.Token `json:"token"`
+	IdToken string
 }
 
 type phantomTokens struct {
 	logger *slog.Logger
 
+	configURL    string
+	clientID     string
+	clientSecret string
+
 	cookieName string
 
-	tokens map[string]storedTokens
+	secretKey []byte
+
+	provider           *oidc.Provider
+	oauth2Config       oauth2.Config
+	insecureSkipVerify bool
 }
 
-func NewPhantomTokenExchange(logger *slog.Logger) PhantomTokenExchange {
-	return &phantomTokens{
-		logger:     logger,
-		cookieName: "__Host-id",
-		tokens:     map[string]storedTokens{},
+func WithCookieName(name string) func(*phantomTokens) {
+	return func(pt *phantomTokens) {
+		pt.cookieName = fmt.Sprintf("__Host-%s", name)
 	}
 }
 
-type sessionID string
+func WithInsecureSkipVerify() func(*phantomTokens) {
+	return func(pt *phantomTokens) {
+		pt.insecureSkipVerify = true
+	}
+}
 
-const sessionIDKey sessionID = "session-id"
+func WithLogger(logger *slog.Logger) func(*phantomTokens) {
+	return func(pt *phantomTokens) {
+		pt.logger = logger
+	}
+}
+
+func WithProvider(configURL, clientID, clientSecret string) func(*phantomTokens) {
+	return func(pt *phantomTokens) {
+		pt.configURL = configURL
+		pt.clientID = clientID
+		pt.clientSecret = clientSecret
+	}
+}
+
+func WithSecretKey(key []byte) func(*phantomTokens) {
+	return func(pt *phantomTokens) {
+		if len(key) != 32 {
+			panic("aes key size must be 32 bytes")
+		}
+		pt.secretKey = key
+	}
+}
+
+func NewPhantomTokenExchange(opts ...func(*phantomTokens)) (PhantomTokenExchange, error) {
+
+	pt := &phantomTokens{}
+
+	for _, opt := range opts {
+		opt(pt)
+	}
+
+	if len(pt.secretKey) == 0 {
+		// Create a random secret if none provided in opts
+		secretKey := make([]byte, 32)
+		_, err := io.ReadFull(rand.Reader, secretKey)
+		if err != nil {
+			return nil, err
+		}
+		WithSecretKey(secretKey)(pt)
+	}
+
+	if pt.cookieName == "" {
+		WithCookieName("id")(pt)
+	}
+
+	go func(ctx context.Context) {
+		provider, err := oidc.NewProvider(ctx, pt.configURL)
+		for err != nil {
+			pt.logger.Info("failed to connect to oidc provider", "err", err.Error())
+			time.Sleep(1 * time.Second)
+			provider, err = oidc.NewProvider(ctx, pt.configURL)
+		}
+
+		pt.provider = provider
+		pt.oauth2Config = oauth2.Config{
+			ClientID:     pt.clientID,
+			ClientSecret: pt.clientSecret,
+			RedirectURL:  "https://xn--lrudden-90a.local:8443/login",
+			Endpoint:     provider.Endpoint(),
+			Scopes:       []string{oidc.ScopeOpenID, "profile", "email"},
+		}
+	}(pt.providerClientContext(context.Background()))
+
+	return pt, nil
+}
+
+type cookieValueKeyType string
+
+const cookieValueKey cookieValueKeyType = "id-cookie"
+
+func (pt *phantomTokens) providerClientContext(ctx context.Context) context.Context {
+	if pt.insecureSkipVerify {
+		pt.logger.Warn("!!! - PROVIDER CERTIFICATE VERIFICATION DISABLED - !!!")
+
+		tr := &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+		client := &http.Client{Transport: tr}
+		ctx = context.WithValue(ctx, oauth2.HTTPClient, client)
+	}
+
+	return ctx
+}
 
 func (pt *phantomTokens) Middleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		fn := func(w http.ResponseWriter, r *http.Request) {
-			cookie, err := r.Cookie(pt.cookieName)
+			cookie, err := pt.getCookie(w, r)
+
 			if err == nil {
-				encryptedValue, err := base64.URLEncoding.DecodeString(cookie.Value)
-				if err != nil {
-					pt.clearCookie(w)
-					next.ServeHTTP(w, r)
-					return
-				}
+				ctx := context.WithValue(r.Context(), cookieValueKey, cookie)
+				r = r.WithContext(ctx)
 
-				secretKey, _ := hex.DecodeString("13d6b4dff8f84a10851021ec8608f814570d562c92fe6b5ec4c9f595bcb3234b")
+				if cookie.Token != nil {
+					if !cookie.Token.Valid() {
+						tokenSource := pt.oauth2Config.TokenSource(pt.providerClientContext(r.Context()), cookie.Token)
+						newToken, err := tokenSource.Token()
+						if err != nil {
+							pt.logger.Error("token source failure", "err", err.Error())
+							pt.clearCookie(w)
+						} else if !newToken.Valid() {
+							pt.logger.Info("refresh token expired and a relogin is required", "session", cookie.SessionID)
+							pt.clearCookie(w)
+						} else {
+							cookie.Token = newToken
+							c, _ := pt.newCookie(*cookie)
+							http.SetCookie(w, c)
+						}
+					}
 
-				// Create a new AES cipher block from the secret key.
-				block, err := aes.NewCipher(secretKey)
-				if err != nil {
-					pt.logger.Error("cipher failure", "err", err.Error())
-					w.WriteHeader(http.StatusInternalServerError)
-					return
-				}
-
-				// Wrap the cipher block in Galois Counter Mode.
-				aesGCM, err := cipher.NewGCM(block)
-				if err != nil {
-					pt.logger.Error("cipher failure", "err", err.Error())
-					w.WriteHeader(http.StatusInternalServerError)
-					return
-				}
-
-				// Get the nonce size.
-				nonceSize := aesGCM.NonceSize()
-
-				// To avoid a potential 'index out of range' panic in the next step, we
-				// check that the length of the encrypted value is at least the nonce
-				// size.
-				if len(encryptedValue) < nonceSize {
-					pt.logger.Error("encrypted cookie value too short", "length", len(encryptedValue))
-					pt.clearCookie(w)
-					w.WriteHeader(http.StatusBadRequest)
-					return
-				}
-
-				// Split apart the nonce from the actual encrypted data.
-				nonce := encryptedValue[:nonceSize]
-				ciphertext := encryptedValue[nonceSize:]
-
-				// Use aesGCM.Open() to decrypt and authenticate the data. If this fails,
-				// return a ErrInvalidValue error.
-				plaintext, err := aesGCM.Open(nil, []byte(nonce), []byte(ciphertext), nil)
-				if err != nil {
-					pt.logger.Error("aes gcm error", "err", err.Error())
-					pt.clearCookie(w)
-					w.WriteHeader(http.StatusBadRequest)
-					return
-				}
-
-				// The plaintext value is in the format "{cookie name}:{cookie value}". We
-				// use strings.Cut() to split it on the first ":" character.
-				expectedName, cookieValue, ok := strings.Cut(string(plaintext), ":")
-				if !ok {
-					pt.logger.Error("malformed cookie value")
-					pt.clearCookie(w)
-					w.WriteHeader(http.StatusBadRequest)
-					return
-				}
-
-				// Check that the cookie name is the expected one and hasn't been changed.
-				if expectedName != pt.cookieName {
-					pt.logger.Error("invalid cookie name")
-					pt.clearCookie(w)
-					w.WriteHeader(http.StatusBadRequest)
-					return
-				}
-
-				// cookie was found
-				pt.logger.Info("cookie found", "value", cookieValue)
-
-				if tokens, ok := pt.tokens[cookieValue]; ok {
-					r.Header.Add("Authorization", "Bearer "+tokens.authToken.AccessToken)
-
-					ctx := context.WithValue(r.Context(), sessionIDKey, cookieValue)
-					r = r.WithContext(ctx)
-				} else {
-					pt.clearCookie(w)
+					if cookie.Token.Valid() {
+						r.Header.Add(
+							"Authorization",
+							cookie.Token.Type()+" "+cookie.Token.AccessToken,
+						)
+					}
 				}
 			}
 
@@ -160,23 +206,110 @@ func (pt *phantomTokens) clearCookie(w http.ResponseWriter) {
 	}
 
 	http.SetCookie(w, &cookie)
+
+	w.Header().Add("HX-Redirect", "/")
 }
 
-func (pt *phantomTokens) newCookie(value string) (*http.Cookie, error) {
+func (pt *phantomTokens) getCookie(w http.ResponseWriter, r *http.Request) (*cookieValue, error) {
+	cookie, err := r.Cookie(pt.cookieName)
+	if err != nil {
+		return nil, err
+	}
+
+	encryptedValue, err := base64.URLEncoding.DecodeString(cookie.Value)
+	if err != nil {
+		pt.clearCookie(w)
+		return nil, fmt.Errorf("decoding failed: %w", err)
+	}
+
+	// Create a new AES cipher block from the secret key.
+	block, err := aes.NewCipher(pt.secretKey)
+	if err != nil {
+		pt.logger.Error("cipher failure", "err", err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return nil, fmt.Errorf("cipher failure: %w", err)
+	}
+
+	// Wrap the cipher block in Galois Counter Mode.
+	aesGCM, err := cipher.NewGCM(block)
+	if err != nil {
+		pt.logger.Error("cipher failure", "err", err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return nil, fmt.Errorf("cipher failure: %w", err)
+	}
+
+	// Get the nonce size.
+	nonceSize := aesGCM.NonceSize()
+
+	// To avoid a potential 'index out of range' panic in the next step, we
+	// check that the length of the encrypted value is at least the nonce size.
+	if len(encryptedValue) < nonceSize {
+		err = errors.New("encrypted value too short")
+		pt.logger.Error(err.Error(), "length", len(encryptedValue))
+		pt.clearCookie(w)
+		w.WriteHeader(http.StatusBadRequest)
+		return nil, err
+	}
+
+	// Split apart the nonce from the actual encrypted data.
+	nonce := encryptedValue[:nonceSize]
+	ciphertext := encryptedValue[nonceSize:]
+
+	// Use aesGCM.Open() to decrypt and authenticate the data. If this fails,
+	// return a ErrInvalidValue error.
+	plaintext, err := aesGCM.Open(nil, []byte(nonce), []byte(ciphertext), nil)
+	if err != nil {
+		pt.logger.Error("aes gcm error", "err", err.Error())
+		pt.clearCookie(w)
+		w.WriteHeader(http.StatusBadRequest)
+		return nil, err
+	}
+
+	zr, err := gzip.NewReader(bytes.NewReader(plaintext))
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+
+	plaintext, err = io.ReadAll(zr)
+	if err != nil {
+		return nil, err
+	}
+
+	value := &cookieValue{}
+	err = json.Unmarshal(plaintext, &value)
+	if err != nil {
+		pt.logger.Error("cookie contents error", "err", err.Error())
+		pt.clearCookie(w)
+		w.WriteHeader(http.StatusBadRequest)
+		return nil, fmt.Errorf("cookie contents error: %w", err)
+	}
+
+	if value.SourceIP != "" && value.SourceIP != r.Header.Get("X-Real-IP") {
+		pt.logger.Error("session ip address changed", "old", value.SourceIP, "new", r.Header.Get("X-Real-IP"))
+		pt.clearCookie(w)
+		w.WriteHeader(http.StatusBadRequest)
+		return nil, errors.New("session ip address changed")
+	}
+
+	// cookie was found
+	pt.logger.Info("cookie found", "value", string(plaintext))
+
+	return value, nil
+}
+
+func (pt *phantomTokens) newCookie(value cookieValue) (*http.Cookie, error) {
+
 	cookie := http.Cookie{
 		Name:     pt.cookieName,
-		Value:    value,
 		Path:     "/",
-		MaxAge:   3600,
 		HttpOnly: true,
 		Secure:   true,
 		SameSite: http.SameSiteLaxMode,
 	}
 
-	secretKey, _ := hex.DecodeString("13d6b4dff8f84a10851021ec8608f814570d562c92fe6b5ec4c9f595bcb3234b")
-
 	// Create a new AES cipher block from the secret key.
-	block, err := aes.NewCipher(secretKey)
+	block, err := aes.NewCipher(pt.secretKey)
 	if err != nil {
 		return nil, err
 	}
@@ -194,18 +327,24 @@ func (pt *phantomTokens) newCookie(value string) (*http.Cookie, error) {
 		return nil, err
 	}
 
-	// Prepare the plaintext input for encryption. Because we want to
-	// authenticate the cookie name as well as the value, we make this plaintext
-	// in the format "{cookie name}:{cookie value}". We use the : character as a
-	// separator because it is an invalid character for cookie names and
-	// therefore shouldn't appear in them.
-	plaintext := fmt.Sprintf("%s:%s", cookie.Name, cookie.Value)
+	marshalledBytes, _ := json.Marshal(value)
+
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	_, err = zw.Write(marshalledBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
 
 	// Encrypt the data using aesGCM.Seal(). By passing the nonce as the first
 	// parameter, the encrypted data will be appended to the nonce — meaning
 	// that the returned encryptedValue variable will be in the format
 	// "{nonce}{encrypted plaintext data}".
-	encryptedValue := aesGCM.Seal(nonce, nonce, []byte(plaintext), nil)
+	encryptedValue := aesGCM.Seal(nonce, nonce, buf.Bytes(), nil)
 
 	// Encode the encrypted cookie value using base64.
 	cookie.Value = base64.URLEncoding.EncodeToString(encryptedValue)
@@ -215,52 +354,38 @@ func (pt *phantomTokens) newCookie(value string) (*http.Cookie, error) {
 
 func (pt *phantomTokens) LoginHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		configURL := "https://iam.xn--lrudden-90a.local:8444/realms/lorudden-test"
-
-		tr := &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		}
-		client := &http.Client{Transport: tr}
-		ctx := context.WithValue(r.Context(), oauth2.HTTPClient, client)
-
-		provider, err := oidc.NewProvider(ctx, configURL)
-		for err != nil {
-			pt.logger.Info("failed to connect to oidc provider", "err", err.Error())
-			time.Sleep(1 * time.Second)
-			provider, err = oidc.NewProvider(ctx, configURL)
-		}
-
-		clientID := "hello-world"
-		clientSecret := "oPMxXzsk6lLntEJqsOpqGZZf4PXHGvRT"
-
-		redirectURL := "https://xn--lrudden-90a.local:8443/login"
-		// Configure an OpenID Connect aware OAuth2 client.
-		oauth2Config := oauth2.Config{
-			ClientID:     clientID,
-			ClientSecret: clientSecret,
-			RedirectURL:  redirectURL,
-			Endpoint:     provider.Endpoint(),
-			Scopes:       []string{oidc.ScopeOpenID, "profile", "email"},
-		}
-
-		state := "268e6917-3ce0-4eda-a404-ed8858968b5c"
-
-		oidcConfig := &oidc.Config{
-			ClientID: clientID,
-		}
-		verifier := provider.Verifier(oidcConfig)
 
 		if r.URL.Query().Get("state") == "" {
-			http.Redirect(w, r, oauth2Config.AuthCodeURL(state), http.StatusFound)
+			state := uuid.NewString()
+			oauth2Verifier := oauth2.GenerateVerifier()
+
+			preLoginCookie := cookieValue{
+				LoginState:     state,
+				LoginValidator: oauth2Verifier,
+			}
+			cookie, _ := pt.newCookie(preLoginCookie)
+			http.SetCookie(w, cookie)
+
+			http.Redirect(w, r, pt.oauth2Config.AuthCodeURL(state, oauth2.S256ChallengeOption(oauth2Verifier)), http.StatusFound)
 			return
 		}
 
-		if r.URL.Query().Get("state") != state {
-			http.Error(w, "state did not match", http.StatusBadRequest)
+		cookie, err := pt.getCookie(w, r)
+		if err != nil {
+			pt.logger.Error("cookie failure", "err", err.Error())
+			http.Error(w, "cookie failure: "+err.Error(), http.StatusBadRequest)
 			return
 		}
 
-		oauth2Token, err := oauth2Config.Exchange(ctx, r.URL.Query().Get("code"))
+		if err != nil || r.URL.Query().Get("state") != cookie.LoginState {
+			pt.logger.Error("state mismatch in login attempt")
+			http.Error(w, "state did not match "+cookie.LoginState, http.StatusBadRequest)
+			return
+		}
+
+		ctx := pt.providerClientContext(r.Context())
+
+		oauth2Token, err := pt.oauth2Config.Exchange(ctx, r.URL.Query().Get("code"), oauth2.VerifierOption(cookie.LoginValidator))
 		if err != nil {
 			http.Error(w, "Failed to exchange token: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -270,6 +395,12 @@ func (pt *phantomTokens) LoginHandler() http.HandlerFunc {
 			http.Error(w, "No id_token field in oauth2 token.", http.StatusInternalServerError)
 			return
 		}
+
+		oidcConfig := &oidc.Config{
+			ClientID: pt.clientID,
+		}
+		verifier := pt.provider.Verifier(oidcConfig)
+
 		idToken, err := verifier.Verify(ctx, rawIDToken)
 		if err != nil {
 			http.Error(w, "Failed to verify ID Token: "+err.Error(), http.StatusInternalServerError)
@@ -293,18 +424,19 @@ func (pt *phantomTokens) LoginHandler() http.HandlerFunc {
 		}
 
 		// TODO: Skapa riktigt random id i stället för uuid
-		tokenID := uuid.NewString()
-		pt.tokens[tokenID] = storedTokens{
-			authToken: oauth2Token,
-			idToken:   rawIDToken,
-		}
+		cookie.SessionID = uuid.NewString()
+		cookie.Token = oauth2Token
+		cookie.IdToken = rawIDToken
 
-		cookie, err := pt.newCookie(tokenID)
+		cookie.SourceIP = r.Header.Get("X-Real-IP")
+
+		newCookie, err := pt.newCookie(*cookie)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 
-		http.SetCookie(w, cookie)
+		pt.logger.Info("setting cookie", "value", newCookie.Value, "length", len(newCookie.Value))
+		http.SetCookie(w, newCookie)
 
 		pt.logger.Info("retrieved token via oidc", "contents", string(data))
 
@@ -314,21 +446,20 @@ func (pt *phantomTokens) LoginHandler() http.HandlerFunc {
 
 func (pt *phantomTokens) LogoutHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		untypedSessionID := r.Context().Value(sessionIDKey)
-		if untypedSessionID == nil {
+		cookie, err := pt.getCookie(w, r)
+		if err != nil {
 			http.Redirect(w, r, "/", http.StatusFound)
 			return
 		}
 
 		pt.clearCookie(w)
 
-		sessionID := untypedSessionID.(string)
-		storedTokens, ok := pt.tokens[string(sessionID)]
+		//storedTokens, ok := pt.tokens[cookie.SessionID]
 
-		if ok {
-			delete(pt.tokens, sessionID)
+		if cookie.Token.Valid() {
+			//delete(pt.tokens, cookie.SessionID)
 
-			logoutURL := "https://iam.xn--lrudden-90a.local:8444/realms/lorudden-test/protocol/openid-connect/logout?id_token_hint=" + storedTokens.idToken + "&post_logout_redirect_uri="
+			logoutURL := pt.configURL + "/protocol/openid-connect/logout?id_token_hint=" + cookie.IdToken + "&post_logout_redirect_uri="
 			logoutURL += url.QueryEscape("https://xn--lrudden-90a.local:8443/")
 
 			http.Redirect(w, r, logoutURL, http.StatusFound)

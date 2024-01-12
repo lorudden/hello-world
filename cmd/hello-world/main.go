@@ -32,11 +32,21 @@ func main() {
 	css, sha256CSS := loadStaticAssetOrDie("./css/output.css")
 	htmx, sha256HTMX := loadStaticAssetOrDie("./js/htmx.min.js")
 
-	tokenExchange := tokens.NewPhantomTokenExchange(logger)
+	tokenExchange, _ := tokens.NewPhantomTokenExchange(
+		tokens.WithLogger(logger),
+		tokens.WithProvider(
+			"https://iam.xn--lrudden-90a.local:8444/realms/lorudden-test",
+			"hello-world",
+			"oPMxXzsk6lLntEJqsOpqGZZf4PXHGvRT",
+		),
+		tokens.WithInsecureSkipVerify(),
+	)
 
 	r.Use(middleware.Logger)
 	r.Use(tokenExchange.Middleware())
-	r.Use(authz.Middleware())
+	r.Use(authz.Middleware(logger))
+
+	// TODO: CORS headers
 
 	r.Get("/", func() http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
