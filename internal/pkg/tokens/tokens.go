@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -58,6 +59,7 @@ type phantomTokens struct {
 	provider           *oidc.Provider
 	oauth2Config       oauth2.Config
 	insecureSkipVerify bool
+	parEndpoint        string
 }
 
 func WithCookieName(name string) func(*phantomTokens) {
@@ -130,8 +132,17 @@ func NewPhantomTokenExchange(opts ...func(*phantomTokens)) (PhantomTokenExchange
 		provider, err := oidc.NewProvider(ctx, pt.configURL)
 		for err != nil {
 			pt.logger.Info("failed to connect to oidc provider", "err", err.Error())
-			time.Sleep(1 * time.Second)
+			time.Sleep(2 * time.Second)
 			provider, err = oidc.NewProvider(ctx, pt.configURL)
+		}
+
+		c := struct {
+			EndpointPAR string `json:"pushed_authorization_request_endpoint"`
+		}{}
+
+		if provider.Claims(&c) == nil {
+			pt.parEndpoint = c.EndpointPAR
+			pt.logger.Info("PAR endpoint found at " + c.EndpointPAR)
 		}
 
 		pt.provider = provider
@@ -304,9 +315,6 @@ func (pt *phantomTokens) getCookie(w http.ResponseWriter, r *http.Request) (*coo
 		return nil, errors.New("session ip address changed")
 	}
 
-	// cookie was found
-	pt.logger.Info("cookie found", "value", string(plaintext))
-
 	return value, nil
 }
 
@@ -371,6 +379,58 @@ func (pt *phantomTokens) LoginHandler() http.HandlerFunc {
 			state := uuid.NewString()
 			oauth2Verifier := oauth2.GenerateVerifier()
 
+			par := url.Values{}
+			par.Add("response_type", "code")
+			par.Add("client_id", pt.clientID)
+			par.Add("scope", strings.Join(pt.oauth2Config.Scopes, " "))
+			par.Add("state", state)
+			par.Add("code_challenge_method", "S256")
+			par.Add("code_challenge", oauth2.S256ChallengeFromVerifier(oauth2Verifier))
+			par.Add("redirect_uri", pt.oauth2Config.RedirectURL)
+
+			postReq, _ := http.NewRequest(http.MethodPost, pt.parEndpoint, strings.NewReader(par.Encode()))
+			postReq.SetBasicAuth(url.QueryEscape(pt.clientID), url.QueryEscape(pt.clientSecret))
+			postReq.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+
+			client := http.DefaultClient
+
+			if pt.insecureSkipVerify {
+				client = &http.Client{
+					Transport: &http.Transport{
+						TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+					},
+				}
+			}
+
+			resp, err := client.Do(postReq)
+			if err != nil {
+				pt.logger.Error("par endpoint failure", "err", err.Error())
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			defer resp.Body.Close()
+
+			respJson, _ := io.ReadAll(resp.Body)
+
+			requestObject := struct {
+				URI              string `json:"request_uri"`
+				Error            string `json:"error"`
+				ErrorDescription string `json:"error_description"`
+			}{}
+			err = json.Unmarshal(respJson, &requestObject)
+
+			if resp.StatusCode >= http.StatusBadRequest {
+				pt.logger.Error("par error", "code", resp.StatusCode, "error", requestObject.Error, "description", requestObject.ErrorDescription)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
+			if resp.StatusCode != http.StatusCreated {
+				pt.logger.Error("invalid response from par endoint", "code", resp.StatusCode)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+
 			preLoginCookie := cookieValue{
 				LoginState:     state,
 				LoginValidator: oauth2Verifier,
@@ -378,7 +438,14 @@ func (pt *phantomTokens) LoginHandler() http.HandlerFunc {
 			cookie, _ := pt.newCookie(preLoginCookie)
 			http.SetCookie(w, cookie)
 
-			http.Redirect(w, r, pt.oauth2Config.AuthCodeURL(state, oauth2.S256ChallengeOption(oauth2Verifier)), http.StatusFound)
+			http.Redirect(w, r,
+				fmt.Sprintf("%s?client_id=%s&request_uri=%s",
+					pt.oauth2Config.Endpoint.AuthURL,
+					pt.clientID,
+					url.QueryEscape(requestObject.URI),
+				),
+				http.StatusFound,
+			)
 			return
 		}
 
@@ -402,6 +469,7 @@ func (pt *phantomTokens) LoginHandler() http.HandlerFunc {
 			http.Error(w, "Failed to exchange token: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
+
 		rawIDToken, ok := oauth2Token.Extra("id_token").(string)
 		if !ok {
 			http.Error(w, "No id_token field in oauth2 token.", http.StatusInternalServerError)
@@ -447,7 +515,6 @@ func (pt *phantomTokens) LoginHandler() http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 
-		pt.logger.Info("setting cookie", "value", newCookie.Value, "length", len(newCookie.Value))
 		http.SetCookie(w, newCookie)
 
 		pt.logger.Info("retrieved token via oidc", "contents", string(data))
