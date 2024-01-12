@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -28,18 +29,13 @@ type PhantomTokenExchange interface {
 	Middleware() func(http.Handler) http.Handler
 
 	LoginHandler() http.HandlerFunc
+	LoginExchangeHandler() http.HandlerFunc
 	LogoutHandler() http.HandlerFunc
 }
 
 type cookieValue struct {
-	LoginState     string `json:"state"`
-	LoginValidator string `json:"validator"`
-
 	SessionID string `json:"session"`
 	SourceIP  string `json:"ip"`
-
-	Token   *oauth2.Token `json:"token"`
-	IdToken string
 }
 
 type phantomTokens struct {
@@ -60,6 +56,9 @@ type phantomTokens struct {
 	oauth2Config       oauth2.Config
 	insecureSkipVerify bool
 	parEndpoint        string
+
+	sessions map[string]*session
+	mu       sync.Mutex
 }
 
 func WithCookieName(name string) func(*phantomTokens) {
@@ -110,7 +109,9 @@ func NewPhantomTokenExchange(opts ...func(*phantomTokens)) (PhantomTokenExchange
 		WithCookieName("id"),
 	}
 
-	pt := &phantomTokens{}
+	pt := &phantomTokens{
+		sessions: map[string]*session{},
+	}
 
 	opts = append(defaults, opts...)
 
@@ -158,10 +159,6 @@ func NewPhantomTokenExchange(opts ...func(*phantomTokens)) (PhantomTokenExchange
 	return pt, nil
 }
 
-type cookieValueKeyType string
-
-const cookieValueKey cookieValueKeyType = "id-cookie"
-
 func (pt *phantomTokens) providerClientContext(ctx context.Context) context.Context {
 	if pt.insecureSkipVerify {
 		pt.logger.Warn("!!! - PROVIDER CERTIFICATE VERIFICATION DISABLED - !!!")
@@ -182,32 +179,13 @@ func (pt *phantomTokens) Middleware() func(http.Handler) http.Handler {
 			cookie, err := pt.getCookie(w, r)
 
 			if err == nil {
-				ctx := context.WithValue(r.Context(), cookieValueKey, cookie)
-				r = r.WithContext(ctx)
-
-				if cookie.Token != nil {
-					if !cookie.Token.Valid() {
-						tokenSource := pt.oauth2Config.TokenSource(pt.providerClientContext(r.Context()), cookie.Token)
-						newToken, err := tokenSource.Token()
-						if err != nil {
-							pt.logger.Error("token source failure", "err", err.Error())
-							pt.clearCookie(w)
-						} else if !newToken.Valid() {
-							pt.logger.Info("refresh token expired and a relogin is required", "session", cookie.SessionID)
-							pt.clearCookie(w)
-						} else {
-							cookie.Token = newToken
-							c, _ := pt.newCookie(*cookie)
-							http.SetCookie(w, c)
-						}
-					}
-
-					if cookie.Token.Valid() {
-						r.Header.Add(
-							"Authorization",
-							cookie.Token.Type()+" "+cookie.Token.AccessToken,
-						)
-					}
+				tokenType, accessToken, err := pt.sessionToken(r.Context(), cookie.SessionID)
+				if err != nil {
+					pt.logger.Error("token source failure or token expired", "err", err.Error())
+					pt.clearCookie(w)
+					pt.clearSession(cookie.SessionID)
+				} else if accessToken != "" {
+					r.Header.Add("Authorization", tokenType+" "+accessToken)
 				}
 			}
 
@@ -225,7 +203,7 @@ func (pt *phantomTokens) clearCookie(w http.ResponseWriter) {
 		MaxAge:   -1,
 		HttpOnly: true,
 		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteStrictMode,
 	}
 
 	http.SetCookie(w, &cookie)
@@ -325,7 +303,7 @@ func (pt *phantomTokens) newCookie(value cookieValue) (*http.Cookie, error) {
 		Path:     "/",
 		HttpOnly: true,
 		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteStrictMode,
 	}
 
 	// Create a new AES cipher block from the secret key.
@@ -372,152 +350,274 @@ func (pt *phantomTokens) newCookie(value cookieValue) (*http.Cookie, error) {
 	return &cookie, nil
 }
 
+type session struct {
+	ID           string
+	LoginState   string
+	PKCEVerifier string
+
+	IDToken     string
+	TokenSource oauth2.TokenSource
+}
+
+func (pt *phantomTokens) clearSession(sessionID string) *session {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+
+	s, ok := pt.sessions[sessionID]
+	if !ok {
+		return nil
+	}
+
+	delete(pt.sessions, sessionID)
+	return s
+}
+
+func (pt *phantomTokens) newSession() *session {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+
+	s := &session{
+		ID:           uuid.NewString(),
+		LoginState:   uuid.NewString(),
+		PKCEVerifier: oauth2.GenerateVerifier(),
+	}
+	pt.sessions[s.ID] = s
+	return s
+}
+
+var ErrNoSuchSession error = errors.New("no such session")
+var ErrRefreshTokenExpired error = errors.New("refresh token expired")
+
+func (pt *phantomTokens) sessionLoginState(ctx context.Context, sessionID string) (string, error) {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+
+	s, ok := pt.sessions[sessionID]
+	if !ok {
+		return "", ErrNoSuchSession
+	}
+
+	return s.LoginState, nil
+}
+
+func (pt *phantomTokens) sessionPKCEVerifier(ctx context.Context, sessionID string) (string, error) {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+
+	s, ok := pt.sessions[sessionID]
+	if !ok {
+		return "", ErrNoSuchSession
+	}
+
+	return s.PKCEVerifier, nil
+}
+
+func (pt *phantomTokens) sessionToken(ctx context.Context, sessionID string) (string, string, error) {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+
+	s, ok := pt.sessions[sessionID]
+	if !ok {
+		return "", "", ErrNoSuchSession
+	}
+
+	t, err := s.TokenSource.Token()
+	if err != nil {
+		return "", "", err
+	} else if !t.Valid() {
+		return "", "", ErrRefreshTokenExpired
+	}
+
+	return t.TokenType, t.AccessToken, nil
+}
+
+func (pt *phantomTokens) sessionTokens(ctx context.Context, sessionID, idToken string, tokenSource oauth2.TokenSource) error {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+
+	s, ok := pt.sessions[sessionID]
+	if !ok {
+		return ErrNoSuchSession
+	}
+
+	s.IDToken = idToken
+	s.TokenSource = tokenSource
+
+	return nil
+}
+
 func (pt *phantomTokens) LoginHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 
-		if r.URL.Query().Get("state") == "" {
-			state := uuid.NewString()
-			oauth2Verifier := oauth2.GenerateVerifier()
+		s := pt.newSession()
 
-			par := url.Values{}
-			par.Add("response_type", "code")
-			par.Add("client_id", pt.clientID)
-			par.Add("scope", strings.Join(pt.oauth2Config.Scopes, " "))
-			par.Add("state", state)
-			par.Add("code_challenge_method", "S256")
-			par.Add("code_challenge", oauth2.S256ChallengeFromVerifier(oauth2Verifier))
-			par.Add("redirect_uri", pt.oauth2Config.RedirectURL)
+		par := url.Values{}
+		par.Add("response_type", "code")
+		par.Add("client_id", pt.clientID)
+		par.Add("scope", strings.Join(pt.oauth2Config.Scopes, " "))
+		par.Add("state", s.LoginState)
+		par.Add("code_challenge_method", "S256")
+		par.Add("code_challenge", oauth2.S256ChallengeFromVerifier(s.PKCEVerifier))
+		par.Add("redirect_uri", pt.oauth2Config.RedirectURL+"/"+s.ID)
 
-			postReq, _ := http.NewRequest(http.MethodPost, pt.parEndpoint, strings.NewReader(par.Encode()))
-			postReq.SetBasicAuth(url.QueryEscape(pt.clientID), url.QueryEscape(pt.clientSecret))
-			postReq.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+		postReq, _ := http.NewRequest(http.MethodPost, pt.parEndpoint, strings.NewReader(par.Encode()))
+		postReq.SetBasicAuth(url.QueryEscape(pt.clientID), url.QueryEscape(pt.clientSecret))
+		postReq.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 
-			client := http.DefaultClient
+		client := http.DefaultClient
 
-			if pt.insecureSkipVerify {
-				client = &http.Client{
-					Transport: &http.Transport{
-						TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-					},
-				}
+		if pt.insecureSkipVerify {
+			client = &http.Client{
+				Transport: &http.Transport{
+					TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+				},
 			}
-
-			resp, err := client.Do(postReq)
-			if err != nil {
-				pt.logger.Error("par endpoint failure", "err", err.Error())
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-			defer resp.Body.Close()
-
-			respJson, _ := io.ReadAll(resp.Body)
-
-			requestObject := struct {
-				URI              string `json:"request_uri"`
-				Error            string `json:"error"`
-				ErrorDescription string `json:"error_description"`
-			}{}
-			err = json.Unmarshal(respJson, &requestObject)
-
-			if resp.StatusCode >= http.StatusBadRequest {
-				pt.logger.Error("par error", "code", resp.StatusCode, "error", requestObject.Error, "description", requestObject.ErrorDescription)
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-
-			if resp.StatusCode != http.StatusCreated {
-				pt.logger.Error("invalid response from par endoint", "code", resp.StatusCode)
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-
-			preLoginCookie := cookieValue{
-				LoginState:     state,
-				LoginValidator: oauth2Verifier,
-			}
-			cookie, _ := pt.newCookie(preLoginCookie)
-			http.SetCookie(w, cookie)
-
-			http.Redirect(w, r,
-				fmt.Sprintf("%s?client_id=%s&request_uri=%s",
-					pt.oauth2Config.Endpoint.AuthURL,
-					pt.clientID,
-					url.QueryEscape(requestObject.URI),
-				),
-				http.StatusFound,
-			)
-			return
 		}
 
-		cookie, err := pt.getCookie(w, r)
+		resp, err := client.Do(postReq)
 		if err != nil {
-			pt.logger.Error("cookie failure", "err", err.Error())
-			http.Error(w, "cookie failure: "+err.Error(), http.StatusBadRequest)
+			pt.logger.Error("par endpoint failure", "err", err.Error())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		defer resp.Body.Close()
+
+		respJson, _ := io.ReadAll(resp.Body)
+
+		requestObject := struct {
+			URI              string `json:"request_uri"`
+			Error            string `json:"error"`
+			ErrorDescription string `json:"error_description"`
+		}{}
+		err = json.Unmarshal(respJson, &requestObject)
+
+		if resp.StatusCode >= http.StatusBadRequest {
+			pt.logger.Error("par error", "code", resp.StatusCode, "error", requestObject.Error, "description", requestObject.ErrorDescription)
+			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 
-		if err != nil || r.URL.Query().Get("state") != cookie.LoginState {
-			pt.logger.Error("state mismatch in login attempt")
-			http.Error(w, "state did not match "+cookie.LoginState, http.StatusBadRequest)
+		if resp.StatusCode != http.StatusCreated {
+			pt.logger.Error("invalid response from par endoint", "code", resp.StatusCode)
+			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+
+		http.Redirect(w, r,
+			fmt.Sprintf("%s?client_id=%s&request_uri=%s",
+				pt.oauth2Config.Endpoint.AuthURL,
+				pt.clientID,
+				url.QueryEscape(requestObject.URI),
+			),
+			http.StatusFound,
+		)
+		return
+	}
+}
+
+func (pt *phantomTokens) LoginExchangeHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 
 		ctx := pt.providerClientContext(r.Context())
 
-		oauth2Token, err := pt.oauth2Config.Exchange(ctx, r.URL.Query().Get("code"), oauth2.VerifierOption(cookie.LoginValidator))
+		// TODO: wait until https://github.com/golang/go/issues/61410 ships
+		urlParts := strings.Split(r.URL.Path, "/")
+		sessionID := urlParts[len(urlParts)-1]
+		loginState, err1 := pt.sessionLoginState(ctx, sessionID)
+		pkceVerifier, err2 := pt.sessionPKCEVerifier(ctx, sessionID)
+
+		if err1 != nil || err2 != nil {
+			pt.logger.Error("attempt to login with invalid session id")
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		state := r.URL.Query().Get("state")
+		if state != loginState {
+			pt.logger.Error("state mismatch in login attempt")
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		exchange := url.Values{
+			"grant_type":    {"authorization_code"},
+			"code":          {r.URL.Query().Get("code")},
+			"code_verifier": {pkceVerifier},
+			"redirect_uri":  {pt.oauth2Config.RedirectURL + "/" + sessionID},
+		}
+
+		postReq, _ := http.NewRequest(http.MethodPost, pt.oauth2Config.Endpoint.TokenURL, strings.NewReader(exchange.Encode()))
+		postReq.SetBasicAuth(url.QueryEscape(pt.clientID), url.QueryEscape(pt.clientSecret))
+		postReq.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+
+		client := http.DefaultClient
+
+		if pt.insecureSkipVerify {
+			client = &http.Client{
+				Transport: &http.Transport{
+					TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+				},
+			}
+		}
+
+		exchangeResponse, err := client.Do(postReq)
+
 		if err != nil {
 			http.Error(w, "Failed to exchange token: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
+		defer exchangeResponse.Body.Close()
 
-		rawIDToken, ok := oauth2Token.Extra("id_token").(string)
-		if !ok {
+		if exchangeResponse.StatusCode != http.StatusOK {
+			http.Error(w, "invalid status code", http.StatusInternalServerError)
+			return
+		}
+
+		body, _ := io.ReadAll(exchangeResponse.Body)
+
+		oauth2Token := &oauth2.Token{}
+		err = json.Unmarshal(body, &oauth2Token)
+		if err != nil {
+			pt.logger.Error("failed to unmarshal token", "err", err.Error())
+			http.Error(w, "failed to unmarshal token: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		pt.logger.Info("token response", "body", string(body))
+
+		extra := &struct {
+			IDToken          string `json:"id_token"`
+			ExpiresIn        int32  `json:"expires_in"`
+			RefreshExpiresIn int32  `json:"refresh_expires_in"`
+		}{}
+		err = json.Unmarshal(body, extra)
+		if err != nil || extra.IDToken == "" {
 			http.Error(w, "No id_token field in oauth2 token.", http.StatusInternalServerError)
 			return
 		}
 
-		oidcConfig := &oidc.Config{
-			ClientID: pt.clientID,
-		}
-		verifier := pt.provider.Verifier(oidcConfig)
+		oauth2Token.Expiry = time.Now().Add(time.Duration(extra.ExpiresIn) * time.Second)
+		pt.logger.Info("token expiry", "when", oauth2Token.Expiry.Format(time.RFC3339))
 
-		idToken, err := verifier.Verify(ctx, rawIDToken)
+		verifier := pt.provider.Verifier(&oidc.Config{ClientID: pt.clientID})
+		_, err = verifier.Verify(ctx, extra.IDToken)
 		if err != nil {
 			http.Error(w, "Failed to verify ID Token: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		resp := struct {
-			OAuth2Token   *oauth2.Token
-			IDTokenClaims *json.RawMessage // ID Token payload is just JSON.
-		}{oauth2Token, new(json.RawMessage)}
+		tokenSource := pt.oauth2Config.TokenSource(context.WithoutCancel(ctx), oauth2Token)
+		err = pt.sessionTokens(ctx, sessionID, extra.IDToken, tokenSource)
 
-		if err := idToken.Claims(&resp.IDTokenClaims); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		data, err := json.MarshalIndent(resp, "", "    ")
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		// TODO: Skapa riktigt random id i stället för uuid
-		cookie.SessionID = uuid.NewString()
-		cookie.Token = oauth2Token
-		cookie.IdToken = rawIDToken
-
-		cookie.SourceIP = r.Header.Get("X-Real-IP")
-
-		newCookie, err := pt.newCookie(*cookie)
+		newCookie, err := pt.newCookie(cookieValue{
+			SessionID: sessionID,
+			SourceIP:  r.Header.Get("X-Real-IP"),
+		})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 
 		http.SetCookie(w, newCookie)
-
-		pt.logger.Info("retrieved token via oidc", "contents", string(data))
 
 		http.Redirect(w, r, "/", http.StatusFound)
 	}
@@ -532,13 +632,17 @@ func (pt *phantomTokens) LogoutHandler() http.HandlerFunc {
 		}
 
 		pt.clearCookie(w)
+		s := pt.clearSession(cookie.SessionID)
 
-		if cookie.Token.Valid() {
-			logoutURL := pt.configURL + "/protocol/openid-connect/logout?id_token_hint=" + cookie.IdToken + "&post_logout_redirect_uri="
-			logoutURL += url.QueryEscape(pt.logoutRedirectURL)
+		if s != nil {
+			t, err := s.TokenSource.Token()
+			if err == nil && t.Valid() {
+				logoutURL := pt.configURL + "/protocol/openid-connect/logout?id_token_hint=" + s.IDToken + "&post_logout_redirect_uri="
+				logoutURL += url.QueryEscape(pt.logoutRedirectURL)
 
-			http.Redirect(w, r, logoutURL, http.StatusFound)
-			return
+				http.Redirect(w, r, logoutURL, http.StatusFound)
+				return
+			}
 		}
 
 		http.Redirect(w, r, "/", http.StatusFound)

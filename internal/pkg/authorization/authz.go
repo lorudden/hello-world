@@ -14,6 +14,7 @@ func NewContextFromAuthorizationHeader(ctx context.Context, r *http.Request, log
 	authHeader := r.Header.Get("Authorization")
 	if authHeader != "" {
 		ctx = context.WithValue(ctx, LoggedIn, "yes")
+		logger.Info("authorized", "header", authHeader)
 	}
 	return ctx, nil
 }

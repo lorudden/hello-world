@@ -68,6 +68,7 @@ func main() {
 	}())
 
 	r.Get("/login", tokenExchange.LoginHandler())
+	r.Get("/login/{id}", tokenExchange.LoginExchangeHandler())
 	r.Get("/logout", tokenExchange.LogoutHandler())
 
 	r.Get("/health/ready", func() http.HandlerFunc {
