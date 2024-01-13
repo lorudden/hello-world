@@ -420,6 +420,18 @@ func (pt *phantomTokens) sessionPKCEVerifier(ctx context.Context, sessionID stri
 	return s.PKCEVerifier, nil
 }
 
+func (pt *phantomTokens) sessionHasToken(ctx context.Context, sessionID string) bool {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+
+	s, ok := pt.sessions[sessionID]
+	if ok && s.TokenState != NONE {
+		return true
+	}
+
+	return false
+}
+
 func (pt *phantomTokens) sessionToken(ctx context.Context, sessionID string) (chan (*oauth2.Token), error) {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
@@ -574,6 +586,12 @@ func (pt *phantomTokens) LoginExchangeHandler() http.HandlerFunc {
 
 		if err1 != nil || err2 != nil {
 			pt.logger.Warn("attempt to login with invalid session id")
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		if pt.sessionHasToken(ctx, sessionID) {
+			pt.logger.Warn("possibly malicious call: this session has already exchanged token", "session", sessionID)
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
