@@ -1,8 +1,6 @@
 package tokens
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -179,13 +177,22 @@ func (pt *phantomTokens) Middleware() func(http.Handler) http.Handler {
 			cookie, err := pt.getCookie(w, r)
 
 			if err == nil {
-				tokenType, accessToken, err := pt.sessionToken(r.Context(), cookie.SessionID)
+				tokenChan, err := pt.sessionToken(r.Context(), cookie.SessionID)
+				var token *oauth2.Token
+				if err == nil {
+					token = <-tokenChan
+				}
+
+				if err == nil && token == nil {
+					err = errors.New("sessionToken returned nil token")
+				}
+
 				if err != nil {
-					pt.logger.Error("token source failure or token expired", "err", err.Error())
+					pt.logger.Error("failed to lookup access token", "err", err.Error(), "session", cookie.SessionID)
 					pt.clearCookie(w)
 					pt.clearSession(cookie.SessionID)
-				} else if accessToken != "" {
-					r.Header.Add("Authorization", tokenType+" "+accessToken)
+				} else if token != nil {
+					r.Header.Add("Authorization", token.TokenType+" "+token.AccessToken)
 				}
 			}
 
@@ -206,6 +213,7 @@ func (pt *phantomTokens) clearCookie(w http.ResponseWriter) {
 		SameSite: http.SameSiteStrictMode,
 	}
 
+	pt.logger.Debug("clearing session cookie from browser")
 	http.SetCookie(w, &cookie)
 
 	w.Header().Add("HX-Redirect", "/")
@@ -256,24 +264,12 @@ func (pt *phantomTokens) getCookie(w http.ResponseWriter, r *http.Request) (*coo
 	nonce := encryptedValue[:nonceSize]
 	ciphertext := encryptedValue[nonceSize:]
 
-	// Use aesGCM.Open() to decrypt and authenticate the data. If this fails,
-	// return a ErrInvalidValue error.
+	// Use aesGCM.Open() to decrypt and authenticate the data.
 	plaintext, err := aesGCM.Open(nil, []byte(nonce), []byte(ciphertext), nil)
 	if err != nil {
-		pt.logger.Error("aes gcm error", "err", err.Error())
+		pt.logger.Error("failed to decrypt and authenticate cookie data", "err", err.Error())
 		pt.clearCookie(w)
 		w.WriteHeader(http.StatusBadRequest)
-		return nil, err
-	}
-
-	zr, err := gzip.NewReader(bytes.NewReader(plaintext))
-	if err != nil {
-		return nil, err
-	}
-	defer zr.Close()
-
-	plaintext, err = io.ReadAll(zr)
-	if err != nil {
 		return nil, err
 	}
 
@@ -287,7 +283,7 @@ func (pt *phantomTokens) getCookie(w http.ResponseWriter, r *http.Request) (*coo
 	}
 
 	if value.SourceIP != "" && value.SourceIP != r.Header.Get("X-Real-IP") {
-		pt.logger.Error("session ip address changed", "old", value.SourceIP, "new", r.Header.Get("X-Real-IP"))
+		pt.logger.Error("session ip address changed", "old", value.SourceIP, "new", r.Header.Get("X-Real-IP"), "session", value.SessionID)
 		pt.clearCookie(w)
 		w.WriteHeader(http.StatusBadRequest)
 		return nil, errors.New("session ip address changed")
@@ -327,22 +323,11 @@ func (pt *phantomTokens) newCookie(value cookieValue) (*http.Cookie, error) {
 
 	marshalledBytes, _ := json.Marshal(value)
 
-	var buf bytes.Buffer
-	zw := gzip.NewWriter(&buf)
-	_, err = zw.Write(marshalledBytes)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := zw.Close(); err != nil {
-		return nil, err
-	}
-
 	// Encrypt the data using aesGCM.Seal(). By passing the nonce as the first
 	// parameter, the encrypted data will be appended to the nonce — meaning
 	// that the returned encryptedValue variable will be in the format
 	// "{nonce}{encrypted plaintext data}".
-	encryptedValue := aesGCM.Seal(nonce, nonce, buf.Bytes(), nil)
+	encryptedValue := aesGCM.Seal(nonce, nonce, marshalledBytes, nil)
 
 	// Encode the encrypted cookie value using base64.
 	cookie.Value = base64.URLEncoding.EncodeToString(encryptedValue)
@@ -350,13 +335,23 @@ func (pt *phantomTokens) newCookie(value cookieValue) (*http.Cookie, error) {
 	return &cookie, nil
 }
 
+type tokenState int
+
+const (
+	NONE       tokenState = 0
+	REFRESHING tokenState = 1
+	ACTIVE     tokenState = 2
+)
+
 type session struct {
 	ID           string
 	LoginState   string
 	PKCEVerifier string
 
-	IDToken     string
-	TokenSource oauth2.TokenSource
+	IDToken    string
+	Token      *oauth2.Token
+	TokenState tokenState
+	TokenQueue []chan (*oauth2.Token)
 }
 
 func (pt *phantomTokens) clearSession(sessionID string) *session {
@@ -366,6 +361,17 @@ func (pt *phantomTokens) clearSession(sessionID string) *session {
 	s, ok := pt.sessions[sessionID]
 	if !ok {
 		return nil
+	}
+
+	pt.logger.Info("clearing session from memory", "session", sessionID)
+
+	// Release any blocked requests that are waiting for a token refresh
+	if len(s.TokenQueue) > 0 {
+		pt.logger.Warn("clearing session with pending token requests", "count", len(s.TokenQueue), "session", sessionID)
+		for _, consumer := range s.TokenQueue {
+			consumer <- nil
+		}
+		s.TokenQueue = []chan (*oauth2.Token){}
 	}
 
 	delete(pt.sessions, sessionID)
@@ -380,12 +386,14 @@ func (pt *phantomTokens) newSession() *session {
 		ID:           uuid.NewString(),
 		LoginState:   uuid.NewString(),
 		PKCEVerifier: oauth2.GenerateVerifier(),
+		TokenQueue:   []chan (*oauth2.Token){},
 	}
 	pt.sessions[s.ID] = s
 	return s
 }
 
 var ErrNoSuchSession error = errors.New("no such session")
+var ErrNoToken error = errors.New("session has no token")
 var ErrRefreshTokenExpired error = errors.New("refresh token expired")
 
 func (pt *phantomTokens) sessionLoginState(ctx context.Context, sessionID string) (string, error) {
@@ -412,26 +420,51 @@ func (pt *phantomTokens) sessionPKCEVerifier(ctx context.Context, sessionID stri
 	return s.PKCEVerifier, nil
 }
 
-func (pt *phantomTokens) sessionToken(ctx context.Context, sessionID string) (string, string, error) {
+func (pt *phantomTokens) sessionToken(ctx context.Context, sessionID string) (chan (*oauth2.Token), error) {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
 
 	s, ok := pt.sessions[sessionID]
 	if !ok {
-		return "", "", ErrNoSuchSession
+		return nil, ErrNoSuchSession
 	}
 
-	t, err := s.TokenSource.Token()
-	if err != nil {
-		return "", "", err
-	} else if !t.Valid() {
-		return "", "", ErrRefreshTokenExpired
+	if s.Token == nil {
+		return nil, ErrNoToken
 	}
 
-	return t.TokenType, t.AccessToken, nil
+	result := make(chan (*oauth2.Token), 1)
+
+	if s.Token.Valid() {
+		result <- s.Token
+	} else {
+		s.TokenQueue = append(s.TokenQueue, result)
+
+		if s.TokenState == ACTIVE {
+			s.TokenState = REFRESHING
+			pt.logger.Info("initiating token refresh", "session", sessionID)
+
+			go func(t *oauth2.Token) {
+				ctx := pt.providerClientContext(context.WithoutCancel(ctx))
+				tokenSource := pt.oauth2Config.TokenSource(ctx, t)
+				t, err := tokenSource.Token()
+
+				if err != nil {
+					pt.logger.Error("failed to refresh token", "err", err.Error(), "session", sessionID)
+					t = nil
+				}
+
+				pt.sessionTokens(ctx, sessionID, s.IDToken, t)
+			}(s.Token)
+		} else {
+			pt.logger.Info("queuing token request due to pending refresh", "session", sessionID)
+		}
+	}
+
+	return result, nil
 }
 
-func (pt *phantomTokens) sessionTokens(ctx context.Context, sessionID, idToken string, tokenSource oauth2.TokenSource) error {
+func (pt *phantomTokens) sessionTokens(ctx context.Context, sessionID, idToken string, token *oauth2.Token) error {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
 
@@ -441,7 +474,17 @@ func (pt *phantomTokens) sessionTokens(ctx context.Context, sessionID, idToken s
 	}
 
 	s.IDToken = idToken
-	s.TokenSource = tokenSource
+	s.Token = token
+	s.TokenState = ACTIVE
+
+	if len(s.TokenQueue) > 0 {
+		pt.logger.Info("sending refreshed token to blocked consumers", "count", len(s.TokenQueue), "session", sessionID)
+
+		for _, consumer := range s.TokenQueue {
+			consumer <- token
+		}
+		s.TokenQueue = []chan (*oauth2.Token){}
+	}
 
 	return nil
 }
@@ -476,7 +519,8 @@ func (pt *phantomTokens) LoginHandler() http.HandlerFunc {
 
 		resp, err := client.Do(postReq)
 		if err != nil {
-			pt.logger.Error("par endpoint failure", "err", err.Error())
+			pt.logger.Error("par endpoint failure", "err", err.Error(), "session", s.ID)
+			pt.clearSession(s.ID)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -492,13 +536,15 @@ func (pt *phantomTokens) LoginHandler() http.HandlerFunc {
 		err = json.Unmarshal(respJson, &requestObject)
 
 		if resp.StatusCode >= http.StatusBadRequest {
-			pt.logger.Error("par error", "code", resp.StatusCode, "error", requestObject.Error, "description", requestObject.ErrorDescription)
+			pt.logger.Error("par error", "code", resp.StatusCode, "error", requestObject.Error, "description", requestObject.ErrorDescription, "session", s.ID)
+			pt.clearSession(s.ID)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 
 		if resp.StatusCode != http.StatusCreated {
-			pt.logger.Error("invalid response from par endoint", "code", resp.StatusCode)
+			pt.logger.Error("invalid response from par endoint", "code", resp.StatusCode, "session", s.ID)
+			pt.clearSession(s.ID)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -527,14 +573,15 @@ func (pt *phantomTokens) LoginExchangeHandler() http.HandlerFunc {
 		pkceVerifier, err2 := pt.sessionPKCEVerifier(ctx, sessionID)
 
 		if err1 != nil || err2 != nil {
-			pt.logger.Error("attempt to login with invalid session id")
+			pt.logger.Warn("attempt to login with invalid session id")
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 
 		state := r.URL.Query().Get("state")
 		if state != loginState {
-			pt.logger.Error("state mismatch in login attempt")
+			pt.logger.Warn("state mismatch in login attempt", "session", sessionID)
+			pt.clearSession(sessionID)
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
@@ -563,13 +610,17 @@ func (pt *phantomTokens) LoginExchangeHandler() http.HandlerFunc {
 		exchangeResponse, err := client.Do(postReq)
 
 		if err != nil {
-			http.Error(w, "Failed to exchange token: "+err.Error(), http.StatusInternalServerError)
+			pt.logger.Error("failed to exchange token", "err", err.Error(), "session", sessionID)
+			pt.clearSession(sessionID)
+			http.Error(w, "failed to exchange token", http.StatusInternalServerError)
 			return
 		}
 		defer exchangeResponse.Body.Close()
 
 		if exchangeResponse.StatusCode != http.StatusOK {
-			http.Error(w, "invalid status code", http.StatusInternalServerError)
+			pt.logger.Error("invalid status code from token server", "code", exchangeResponse.StatusCode, "session", sessionID)
+			pt.clearSession(sessionID)
+			http.Error(w, "invalid status code from token server", http.StatusInternalServerError)
 			return
 		}
 
@@ -578,12 +629,13 @@ func (pt *phantomTokens) LoginExchangeHandler() http.HandlerFunc {
 		oauth2Token := &oauth2.Token{}
 		err = json.Unmarshal(body, &oauth2Token)
 		if err != nil {
-			pt.logger.Error("failed to unmarshal token", "err", err.Error())
+			pt.logger.Error("failed to unmarshal token", "err", err.Error(), "session", sessionID)
+			pt.clearSession(sessionID)
 			http.Error(w, "failed to unmarshal token: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		pt.logger.Info("token response", "body", string(body))
+		pt.logger.Info("token response", "body", string(body), "session", sessionID)
 
 		extra := &struct {
 			IDToken          string `json:"id_token"`
@@ -592,22 +644,22 @@ func (pt *phantomTokens) LoginExchangeHandler() http.HandlerFunc {
 		}{}
 		err = json.Unmarshal(body, extra)
 		if err != nil || extra.IDToken == "" {
-			http.Error(w, "No id_token field in oauth2 token.", http.StatusInternalServerError)
+			pt.clearSession(sessionID)
+			http.Error(w, "no id_token field in oauth2 token.", http.StatusInternalServerError)
 			return
 		}
 
 		oauth2Token.Expiry = time.Now().Add(time.Duration(extra.ExpiresIn) * time.Second)
-		pt.logger.Info("token expiry", "when", oauth2Token.Expiry.Format(time.RFC3339))
+		pt.logger.Info("token expiry", "when", oauth2Token.Expiry.Format(time.RFC3339), "session", sessionID)
 
 		verifier := pt.provider.Verifier(&oidc.Config{ClientID: pt.clientID})
 		_, err = verifier.Verify(ctx, extra.IDToken)
 		if err != nil {
-			http.Error(w, "Failed to verify ID Token: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "failed to verify id token: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		tokenSource := pt.oauth2Config.TokenSource(context.WithoutCancel(ctx), oauth2Token)
-		err = pt.sessionTokens(ctx, sessionID, extra.IDToken, tokenSource)
+		err = pt.sessionTokens(ctx, sessionID, extra.IDToken, oauth2Token)
 
 		newCookie, err := pt.newCookie(cookieValue{
 			SessionID: sessionID,
@@ -634,15 +686,12 @@ func (pt *phantomTokens) LogoutHandler() http.HandlerFunc {
 		pt.clearCookie(w)
 		s := pt.clearSession(cookie.SessionID)
 
-		if s != nil {
-			t, err := s.TokenSource.Token()
-			if err == nil && t.Valid() {
-				logoutURL := pt.configURL + "/protocol/openid-connect/logout?id_token_hint=" + s.IDToken + "&post_logout_redirect_uri="
-				logoutURL += url.QueryEscape(pt.logoutRedirectURL)
+		if s != nil && s.Token.Valid() {
+			logoutURL := pt.configURL + "/protocol/openid-connect/logout?id_token_hint=" + s.IDToken + "&post_logout_redirect_uri="
+			logoutURL += url.QueryEscape(pt.logoutRedirectURL)
 
-				http.Redirect(w, r, logoutURL, http.StatusFound)
-				return
-			}
+			http.Redirect(w, r, logoutURL, http.StatusFound)
+			return
 		}
 
 		http.Redirect(w, r, "/", http.StatusFound)
