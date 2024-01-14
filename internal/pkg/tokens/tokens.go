@@ -54,6 +54,7 @@ type phantomTokens struct {
 	oauth2Config       oauth2.Config
 	insecureSkipVerify bool
 	parEndpoint        string
+	logoutEndpoint     string
 
 	sessions map[string]*session
 	mu       sync.Mutex
@@ -61,6 +62,8 @@ type phantomTokens struct {
 
 func WithCookieName(name string) func(*phantomTokens) {
 	return func(pt *phantomTokens) {
+		// Prepend the cookie name with __Host- to create a "domain locked" cookie.
+		// See: https://developer.mozilla.org/en-US/docs/Web/HTTP/Cookies#__host-
 		pt.cookieName = fmt.Sprintf("__Host-%s", name)
 	}
 }
@@ -136,12 +139,17 @@ func NewPhantomTokenExchange(opts ...func(*phantomTokens)) (PhantomTokenExchange
 		}
 
 		c := struct {
-			EndpointPAR string `json:"pushed_authorization_request_endpoint"`
+			EndpointPAR    string `json:"pushed_authorization_request_endpoint"`
+			EndpointLogout string `json:"end_session_endpoint"`
 		}{}
 
 		if provider.Claims(&c) == nil {
 			pt.parEndpoint = c.EndpointPAR
-			pt.logger.Info("PAR endpoint found at " + c.EndpointPAR)
+			pt.logoutEndpoint = c.EndpointLogout
+
+			if pt.parEndpoint != "" {
+				pt.logger.Info("PAR endpoint found at " + c.EndpointPAR)
+			}
 		}
 
 		pt.provider = provider
@@ -294,6 +302,8 @@ func (pt *phantomTokens) getCookie(w http.ResponseWriter, r *http.Request) (*coo
 
 func (pt *phantomTokens) newCookie(value cookieValue) (*http.Cookie, error) {
 
+	// Set httponly, secure and strict samesite mode for our cookies
+	// See https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html#cookies
 	cookie := http.Cookie{
 		Name:     pt.cookieName,
 		Path:     "/",
@@ -596,10 +606,17 @@ func (pt *phantomTokens) LoginExchangeHandler() http.HandlerFunc {
 			return
 		}
 
+		var err error
+		defer func() {
+			if err != nil {
+				pt.clearSession(sessionID)
+			}
+		}()
+
 		state := r.URL.Query().Get("state")
 		if state != loginState {
-			pt.logger.Warn("state mismatch in login attempt", "session", sessionID)
-			pt.clearSession(sessionID)
+			err = errors.New("state parameter does not match")
+			pt.logger.Warn("suspicious login attempt", "session", sessionID, "err", err.Error())
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
@@ -629,15 +646,14 @@ func (pt *phantomTokens) LoginExchangeHandler() http.HandlerFunc {
 
 		if err != nil {
 			pt.logger.Error("failed to exchange token", "err", err.Error(), "session", sessionID)
-			pt.clearSession(sessionID)
 			http.Error(w, "failed to exchange token", http.StatusInternalServerError)
 			return
 		}
 		defer exchangeResponse.Body.Close()
 
 		if exchangeResponse.StatusCode != http.StatusOK {
-			pt.logger.Error("invalid status code from token server", "code", exchangeResponse.StatusCode, "session", sessionID)
-			pt.clearSession(sessionID)
+			err = fmt.Errorf("invalid status code")
+			pt.logger.Error("token server error", "code", exchangeResponse.StatusCode, "session", sessionID)
 			http.Error(w, "invalid status code from token server", http.StatusInternalServerError)
 			return
 		}
@@ -648,7 +664,6 @@ func (pt *phantomTokens) LoginExchangeHandler() http.HandlerFunc {
 		err = json.Unmarshal(body, &oauth2Token)
 		if err != nil {
 			pt.logger.Error("failed to unmarshal token", "err", err.Error(), "session", sessionID)
-			pt.clearSession(sessionID)
 			http.Error(w, "failed to unmarshal token: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -662,7 +677,6 @@ func (pt *phantomTokens) LoginExchangeHandler() http.HandlerFunc {
 		}{}
 		err = json.Unmarshal(body, extra)
 		if err != nil || extra.IDToken == "" {
-			pt.clearSession(sessionID)
 			http.Error(w, "no id_token field in oauth2 token.", http.StatusInternalServerError)
 			return
 		}
@@ -677,18 +691,19 @@ func (pt *phantomTokens) LoginExchangeHandler() http.HandlerFunc {
 			return
 		}
 
-		err = pt.sessionTokens(ctx, sessionID, extra.IDToken, oauth2Token)
+		pt.sessionTokens(ctx, sessionID, extra.IDToken, oauth2Token)
 
-		newCookie, err := pt.newCookie(cookieValue{
+		var newCookie *http.Cookie
+		newCookie, err = pt.newCookie(cookieValue{
 			SessionID: sessionID,
 			SourceIP:  r.Header.Get("X-Real-IP"),
 		})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 
 		http.SetCookie(w, newCookie)
-
 		http.Redirect(w, r, "/", http.StatusFound)
 	}
 }
@@ -705,7 +720,7 @@ func (pt *phantomTokens) LogoutHandler() http.HandlerFunc {
 		s := pt.clearSession(cookie.SessionID)
 
 		if s != nil && s.Token.Valid() {
-			logoutURL := pt.configURL + "/protocol/openid-connect/logout?id_token_hint=" + s.IDToken + "&post_logout_redirect_uri="
+			logoutURL := pt.logoutEndpoint + "?id_token_hint=" + s.IDToken + "&post_logout_redirect_uri="
 			logoutURL += url.QueryEscape(pt.logoutRedirectURL)
 
 			http.Redirect(w, r, logoutURL, http.StatusFound)
