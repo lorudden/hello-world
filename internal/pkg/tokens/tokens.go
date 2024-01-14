@@ -223,8 +223,6 @@ func (pt *phantomTokens) clearCookie(w http.ResponseWriter) {
 
 	pt.logger.Debug("clearing session cookie from browser")
 	http.SetCookie(w, &cookie)
-
-	w.Header().Add("HX-Redirect", "/")
 }
 
 func (pt *phantomTokens) getCookie(w http.ResponseWriter, r *http.Request) (*cookieValue, error) {
