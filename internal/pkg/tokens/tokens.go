@@ -171,13 +171,13 @@ func NewPhantomTokenExchange(opts ...func(*phantomTokens)) (PhantomTokenExchange
 		}
 
 		c := struct {
-			EndpointPAR    string `json:"pushed_authorization_request_endpoint"`
-			EndpointLogout string `json:"end_session_endpoint"`
+			EndpointPAR        string `json:"pushed_authorization_request_endpoint"`
+			EndpointEndSession string `json:"end_session_endpoint"`
 		}{}
 
 		if provider.Claims(&c) == nil {
 			pt.parEndpoint = c.EndpointPAR
-			pt.logoutEndpoint = c.EndpointLogout
+			pt.endSessionEndpoint = c.EndpointEndSession
 
 			if pt.parEndpoint != "" {
 				pt.logger.Info("PAR endpoint found at " + c.EndpointPAR)
