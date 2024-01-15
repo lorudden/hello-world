@@ -33,22 +33,22 @@ func main() {
 	htmx, sha256HTMX := loadStaticAssetOrDie("./js/htmx.min.js")
 
 	tokenExchange, _ := tokens.NewPhantomTokenExchange(
+		tokens.WithAppRoot("https://xn--lrudden-90a.local:8443/"),
 		tokens.WithLogger(logger),
 		tokens.WithProvider(
 			"https://iam.xn--lrudden-90a.local:8444/realms/lorudden-test",
 			"hello-world",
 			"oPMxXzsk6lLntEJqsOpqGZZf4PXHGvRT",
 		),
-		tokens.WithRedirects(
-			"https://xn--lrudden-90a.local:8443/login",
-			"https://xn--lrudden-90a.local:8443/",
-		),
 		tokens.WithInsecureSkipVerify(),
 	)
+	defer tokenExchange.Shutdown()
 
 	r.Use(middleware.Logger)
 	r.Use(tokenExchange.Middleware())
 	r.Use(authz.Middleware(logger))
+
+	tokenExchange.InstallChiHandlers(r)
 
 	// TODO: CORS headers
 
@@ -66,10 +66,6 @@ func main() {
 			component.Render(r.Context(), w)
 		}
 	}())
-
-	r.Get("/login", tokenExchange.LoginHandler())
-	r.Get("/login/{id}", tokenExchange.LoginExchangeHandler())
-	r.Get("/logout", tokenExchange.LogoutHandler())
 
 	r.Get("/health/ready", func() http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {

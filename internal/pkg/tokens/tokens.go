@@ -19,16 +19,15 @@ import (
 	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"golang.org/x/oauth2"
 )
 
 type PhantomTokenExchange interface {
 	Middleware() func(http.Handler) http.Handler
-
-	LoginHandler() http.HandlerFunc
-	LoginExchangeHandler() http.HandlerFunc
-	LogoutHandler() http.HandlerFunc
+	InstallChiHandlers(r *chi.Mux)
+	Shutdown()
 }
 
 type cookieValue struct {
@@ -39,11 +38,15 @@ type cookieValue struct {
 type phantomTokens struct {
 	logger *slog.Logger
 
+	appRoot string
+
 	configURL    string
 	clientID     string
 	clientSecret string
 
-	loginRedirectURL  string
+	loginEndpoint  string
+	logoutEndpoint string
+
 	logoutRedirectURL string
 
 	cookieName string
@@ -54,10 +57,25 @@ type phantomTokens struct {
 	oauth2Config       oauth2.Config
 	insecureSkipVerify bool
 	parEndpoint        string
-	logoutEndpoint     string
+	endSessionEndpoint string
 
 	sessions map[string]*session
 	mu       sync.Mutex
+}
+
+func (pt *phantomTokens) InstallChiHandlers(r *chi.Mux) {
+	r.Get(pt.loginEndpoint, pt.LoginHandler())
+	r.Get(pt.loginEndpoint+"/{id}", pt.LoginExchangeHandler())
+	r.Get(pt.logoutEndpoint, pt.LogoutHandler())
+}
+
+func WithAppRoot(appRoot string) func(*phantomTokens) {
+	return func(pt *phantomTokens) {
+		if strings.HasSuffix(appRoot, "/") {
+			appRoot = appRoot[0 : len(appRoot)-1]
+		}
+		pt.appRoot = appRoot
+	}
 }
 
 func WithCookieName(name string) func(*phantomTokens) {
@@ -80,18 +98,31 @@ func WithLogger(logger *slog.Logger) func(*phantomTokens) {
 	}
 }
 
+func WithLoginLogoutEndpoints(loginEndpoint, logoutEndpoint string) func(*phantomTokens) {
+	mustBeNonEmptyAndNotEndWithSlash := func(ep string) {
+		if len(ep) == 0 {
+			panic("endpoint must not be empty")
+		}
+
+		if strings.HasSuffix(ep, "/") {
+			panic("endpoint must not end with a slash")
+		}
+	}
+
+	return func(pt *phantomTokens) {
+		mustBeNonEmptyAndNotEndWithSlash(loginEndpoint)
+		mustBeNonEmptyAndNotEndWithSlash(logoutEndpoint)
+
+		pt.loginEndpoint = loginEndpoint
+		pt.logoutEndpoint = logoutEndpoint
+	}
+}
+
 func WithProvider(configURL, clientID, clientSecret string) func(*phantomTokens) {
 	return func(pt *phantomTokens) {
 		pt.configURL = configURL
 		pt.clientID = clientID
 		pt.clientSecret = clientSecret
-	}
-}
-
-func WithRedirects(login, logout string) func(*phantomTokens) {
-	return func(pt *phantomTokens) {
-		pt.loginRedirectURL = login
-		pt.logoutRedirectURL = logout
 	}
 }
 
@@ -108,6 +139,7 @@ func NewPhantomTokenExchange(opts ...func(*phantomTokens)) (PhantomTokenExchange
 
 	defaults := []func(*phantomTokens){
 		WithCookieName("id"),
+		WithLoginLogoutEndpoints("/login", "/logout"),
 	}
 
 	pt := &phantomTokens{
@@ -156,7 +188,6 @@ func NewPhantomTokenExchange(opts ...func(*phantomTokens)) (PhantomTokenExchange
 		pt.oauth2Config = oauth2.Config{
 			ClientID:     pt.clientID,
 			ClientSecret: pt.clientSecret,
-			RedirectURL:  pt.loginRedirectURL,
 			Endpoint:     provider.Endpoint(),
 			Scopes:       []string{oidc.ScopeOpenID, "profile", "email"},
 		}
@@ -164,6 +195,8 @@ func NewPhantomTokenExchange(opts ...func(*phantomTokens)) (PhantomTokenExchange
 
 	return pt, nil
 }
+
+func (pt *phantomTokens) Shutdown() {}
 
 func (pt *phantomTokens) providerClientContext(ctx context.Context) context.Context {
 	if pt.insecureSkipVerify {
@@ -511,7 +544,6 @@ func (pt *phantomTokens) sessionTokens(ctx context.Context, sessionID, idToken s
 
 func (pt *phantomTokens) LoginHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-
 		s := pt.newSession()
 
 		par := url.Values{}
@@ -521,7 +553,7 @@ func (pt *phantomTokens) LoginHandler() http.HandlerFunc {
 		par.Add("state", s.LoginState)
 		par.Add("code_challenge_method", "S256")
 		par.Add("code_challenge", oauth2.S256ChallengeFromVerifier(s.PKCEVerifier))
-		par.Add("redirect_uri", pt.oauth2Config.RedirectURL+"/"+s.ID)
+		par.Add("redirect_uri", pt.appRoot+pt.loginEndpoint+"/"+s.ID)
 
 		postReq, _ := http.NewRequest(http.MethodPost, pt.parEndpoint, strings.NewReader(par.Encode()))
 		postReq.SetBasicAuth(url.QueryEscape(pt.clientID), url.QueryEscape(pt.clientSecret))
@@ -623,7 +655,7 @@ func (pt *phantomTokens) LoginExchangeHandler() http.HandlerFunc {
 			"grant_type":    {"authorization_code"},
 			"code":          {r.URL.Query().Get("code")},
 			"code_verifier": {pkceVerifier},
-			"redirect_uri":  {pt.oauth2Config.RedirectURL + "/" + sessionID},
+			"redirect_uri":  {pt.appRoot + pt.loginEndpoint + "/" + sessionID},
 		}
 
 		postReq, _ := http.NewRequest(http.MethodPost, pt.oauth2Config.Endpoint.TokenURL, strings.NewReader(exchange.Encode()))
@@ -718,8 +750,8 @@ func (pt *phantomTokens) LogoutHandler() http.HandlerFunc {
 		s := pt.clearSession(cookie.SessionID)
 
 		if s != nil && s.Token.Valid() {
-			logoutURL := pt.logoutEndpoint + "?id_token_hint=" + s.IDToken + "&post_logout_redirect_uri="
-			logoutURL += url.QueryEscape(pt.logoutRedirectURL)
+			logoutURL := pt.endSessionEndpoint + "?id_token_hint=" + s.IDToken + "&post_logout_redirect_uri="
+			logoutURL += url.QueryEscape(pt.appRoot)
 
 			http.Redirect(w, r, logoutURL, http.StatusFound)
 			return
