@@ -30,7 +30,7 @@ type PhantomTokenExchange interface {
 	Shutdown()
 }
 
-type cookieValue struct {
+type cookieContents struct {
 	SessionID string `json:"session"`
 	SourceIP  string `json:"ip"`
 }
@@ -56,8 +56,9 @@ type phantomTokens struct {
 	provider           *oidc.Provider
 	oauth2Config       oauth2.Config
 	insecureSkipVerify bool
-	parEndpoint        string
-	endSessionEndpoint string
+
+	endSessionEndpoint                  string
+	pushedAuthenticationRequestEndpoint string
 
 	sessions map[string]*session
 	mu       sync.Mutex
@@ -71,7 +72,7 @@ func (pt *phantomTokens) InstallChiHandlers(r *chi.Mux) {
 
 func WithAppRoot(appRoot string) func(*phantomTokens) {
 	return func(pt *phantomTokens) {
-		if strings.HasSuffix(appRoot, "/") {
+		for strings.HasSuffix(appRoot, "/") {
 			appRoot = appRoot[0 : len(appRoot)-1]
 		}
 		pt.appRoot = appRoot
@@ -176,10 +177,10 @@ func NewPhantomTokenExchange(opts ...func(*phantomTokens)) (PhantomTokenExchange
 		}{}
 
 		if provider.Claims(&c) == nil {
-			pt.parEndpoint = c.EndpointPAR
+			pt.pushedAuthenticationRequestEndpoint = c.EndpointPAR
 			pt.endSessionEndpoint = c.EndpointEndSession
 
-			if pt.parEndpoint != "" {
+			if pt.pushedAuthenticationRequestEndpoint != "" {
 				pt.logger.Info("PAR endpoint found at " + c.EndpointPAR)
 			}
 		}
@@ -258,7 +259,7 @@ func (pt *phantomTokens) clearCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &cookie)
 }
 
-func (pt *phantomTokens) getCookie(w http.ResponseWriter, r *http.Request) (*cookieValue, error) {
+func (pt *phantomTokens) getCookie(w http.ResponseWriter, r *http.Request) (*cookieContents, error) {
 	cookie, err := r.Cookie(pt.cookieName)
 	if err != nil {
 		return nil, err
@@ -312,7 +313,7 @@ func (pt *phantomTokens) getCookie(w http.ResponseWriter, r *http.Request) (*coo
 		return nil, err
 	}
 
-	value := &cookieValue{}
+	value := &cookieContents{}
 	err = json.Unmarshal(plaintext, &value)
 	if err != nil {
 		pt.logger.Error("cookie contents error", "err", err.Error())
@@ -331,7 +332,7 @@ func (pt *phantomTokens) getCookie(w http.ResponseWriter, r *http.Request) (*coo
 	return value, nil
 }
 
-func (pt *phantomTokens) newCookie(value cookieValue) (*http.Cookie, error) {
+func (pt *phantomTokens) newCookie(value cookieContents) (*http.Cookie, error) {
 
 	// Set httponly, secure and strict samesite mode for our cookies
 	// See https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html#cookies
@@ -555,7 +556,7 @@ func (pt *phantomTokens) LoginHandler() http.HandlerFunc {
 		par.Add("code_challenge", oauth2.S256ChallengeFromVerifier(s.PKCEVerifier))
 		par.Add("redirect_uri", pt.appRoot+pt.loginEndpoint+"/"+s.ID)
 
-		postReq, _ := http.NewRequest(http.MethodPost, pt.parEndpoint, strings.NewReader(par.Encode()))
+		postReq, _ := http.NewRequest(http.MethodPost, pt.pushedAuthenticationRequestEndpoint, strings.NewReader(par.Encode()))
 		postReq.SetBasicAuth(url.QueryEscape(pt.clientID), url.QueryEscape(pt.clientSecret))
 		postReq.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 
@@ -724,7 +725,7 @@ func (pt *phantomTokens) LoginExchangeHandler() http.HandlerFunc {
 		pt.sessionTokens(ctx, sessionID, extra.IDToken, oauth2Token)
 
 		var newCookie *http.Cookie
-		newCookie, err = pt.newCookie(cookieValue{
+		newCookie, err = pt.newCookie(cookieContents{
 			SessionID: sessionID,
 			SourceIP:  r.Header.Get("X-Real-IP"),
 		})
